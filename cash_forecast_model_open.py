@@ -1,3 +1,5 @@
+# python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
+
 import argparse
 import boto3
 import pandas as pd
@@ -13,6 +15,24 @@ from dataclasses import dataclass
 import yaml
 import tempfile
 import glob  # Fix for Issue 4: Import glob module
+from pydantic import BaseModel, Field, ValidationError  # Need to add ValidationError
+
+
+
+
+class ConfigModel(BaseModel):
+    """Pydantic model for configuration validation"""
+    region: str
+    bucket: str
+    prefix: str
+    role_arn: str
+    instance_type: str = "ml.m5.large"
+    instance_count: int = 1
+    forecast_horizon: int = 10
+    forecast_frequency: str = "1D"
+    batch_size: int = 100
+    quantiles: List[str] = ['p10', 'p50', 'p90']
+    iterative_forecast_steps: int = 1
 
 @dataclass
 class Config:
@@ -25,8 +45,9 @@ class Config:
     instance_count: int = 1
     forecast_horizon: int = 10
     forecast_frequency: str = "1D"
-    batch_size: int = 100  # Fix for Issue 8: Make batch_size configurable
-    quantiles: List[str] = ('0.1', '0.5', '0.9')  # Fix for Issue 6: Configurable quantiles
+    batch_size: int = 100
+    quantiles: List[str] = ('p10', 'p50', 'p90')
+    iterative_forecast_steps: int = 1  # Added to match ConfigModel
 
 class CashForecastingPipeline:
     def __init__(self, config: Config):
@@ -155,7 +176,7 @@ class CashForecastingPipeline:
                 'TimeSeriesForecastingJobConfig': {
                     'ForecastFrequency': self.config.forecast_frequency,
                     'ForecastHorizon': self.config.forecast_horizon,
-                    'ForecastQuantiles': self.config.quantiles,  # Use quantiles from config (Fix for Issue 6)
+                    'ForecastQuantiles': self.config.quantiles,
                     'TimeSeriesConfig': {
                         'TargetAttributeName': 'Demand',
                         'TimestampAttributeName': 'EffectiveDate',
@@ -372,120 +393,136 @@ class CashForecastingPipeline:
             response = self.s3_client.list_objects_v2(Bucket=self.config.bucket, Prefix=output_s3_prefix)
         except Exception as e:
             self.logger.error(f"Failed to list objects in S3: {e}")
-            raise  # Fix for Issue 7
+            raise
 
         if 'Contents' not in response:
             raise FileNotFoundError(f"No inference results found in S3 for {output_s3_prefix}")
 
-        # Create a temporary directory to store downloaded files
+        # Create a temporary directory
         temp_dir = f"./temp/{country_code}_{self.timestamp}/"
         os.makedirs(temp_dir, exist_ok=True)
 
-        # Download all output files
-        forecast_data = []
-        for obj in response['Contents']:
-            s3_key = obj['Key']
-            if s3_key.endswith('.out'):
-                local_file = os.path.join(temp_dir, os.path.basename(s3_key))
+        try:
+            # Download and process forecast files
+            forecast_data = []
+            for obj in response['Contents']:
+                s3_key = obj['Key']
+                if s3_key.endswith('.out'):
+                    local_file = os.path.join(temp_dir, os.path.basename(s3_key))
+                    try:
+                        self.s3_client.download_file(self.config.bucket, s3_key, local_file)
+                        df = pd.read_csv(local_file, header=None)
+                        forecast_data.append(df)
+                    except Exception as e:
+                        self.logger.error(f"Failed to process {s3_key}: {e}")
+                        continue
+                    finally:
+                        if os.path.exists(local_file):
+                            os.remove(local_file)
+
+            if not forecast_data:
+                raise FileNotFoundError("No forecast output files found.")
+
+            # Combine forecast data
+            forecast_df = pd.concat(forecast_data, ignore_index=True)
+
+            # Assign quantile columns - using the exact format from config
+            forecast_df.columns = self.config.quantiles
+
+            # Load and combine inference data
+            inference_files = glob.glob(os.path.join(self.output_dir, f"{country_code}_inference_batch_*.csv"))
+            if not inference_files:
+                raise FileNotFoundError(f"No inference batch files found in {self.output_dir}")
+
+            inference_data_list = []
+            for file in inference_files:
                 try:
-                    self.s3_client.download_file(self.config.bucket, s3_key, local_file)
+                    df = pd.read_csv(file)
+                    inference_data_list.append(df)
                 except Exception as e:
-                    self.logger.error(f"Failed to download {s3_key}: {e}")
-                    continue  # Proceed to next file
-                df = pd.read_csv(local_file, header=None)
-                forecast_data.append(df)
-                os.remove(local_file)  # Clean up to prevent resource leaks (Fix for Issue 9)
+                    self.logger.error(f"Failed to read inference file {file}: {e}")
+                    continue
+                finally:
+                    if os.path.exists(file):
+                        os.remove(file)
 
-        if not forecast_data:
-            raise FileNotFoundError("No forecast output files found.")
+            if not inference_data_list:
+                raise ValueError("No valid inference data found")
 
-        # Combine all forecast data
-        forecast_df = pd.concat(forecast_data, ignore_index=True)
+            inference_data = pd.concat(inference_data_list, ignore_index=True)
 
-        # The forecast output may not have headers, so assign them
-        # Use quantiles from config (Fix for Issue 6)
-        quantile_cols = [f"p{int(float(q)*100)}" for q in self.config.quantiles]
-        forecast_df.columns = quantile_cols
+            # Convert dates
+            for date_col in ['EffectiveDate', 'ForecastDate']:
+                if date_col in inference_data.columns:
+                    inference_data[date_col] = pd.to_datetime(inference_data[date_col]).dt.tz_localize(None)
 
-        # Load inference data to get identifiers
-        inference_files = glob.glob(os.path.join(self.output_dir, f"{country_code}_inference_batch_*.csv"))
-        if not inference_files:
-            raise FileNotFoundError(f"No inference batch files found in {self.output_dir}")
-        inference_data_list = []
-        for file in inference_files:
-            df = pd.read_csv(file)
-            inference_data_list.append(df)
-            os.remove(file)  # Clean up to prevent resource leaks (Fix for Issue 9)
-        inference_data = pd.concat(inference_data_list, ignore_index=True)
+            # Debug logging
+            self.logger.info(f"Inference data columns: {inference_data.columns.tolist()}")
+            self.logger.info(f"Forecast df columns: {forecast_df.columns.tolist()}")
 
-        # Ensure dates are in correct format
-        inference_data['EffectiveDate'] = pd.to_datetime(inference_data['EffectiveDate']).dt.tz_localize(None)
-        inference_data['ForecastDate'] = pd.to_datetime(inference_data['ForecastDate']).dt.tz_localize(None)
+            # Combine inference data with forecasts
+            forecast_df = pd.concat([
+                inference_data[['ProductId', 'BranchId', 'CountryCode', 'Currency',
+                                'EffectiveDate', 'ForecastDate']].reset_index(drop=True),
+                forecast_df.reset_index(drop=True)
+            ], axis=1)
 
-        # Combine inference data with forecasts
-        forecast_df = pd.concat(
-            [inference_data[['ProductId', 'BranchId', 'CountryCode', 'Currency', 'EffectiveDate', 'ForecastDate']].reset_index(drop=True),
-             forecast_df.reset_index(drop=True)], axis=1)
+            return forecast_df
 
-        # Clean up temporary directory
-        os.rmdir(temp_dir)
-
-        return forecast_df
+        except Exception as e:
+            self.logger.error(f"Error in _get_forecast_result: {str(e)}")
+            raise
+        finally:
+            # Cleanup
+            if os.path.exists(temp_dir):
+                try:
+                    os.rmdir(temp_dir)
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
 
     def _save_forecasts(self, country_code: str, forecasts_df: pd.DataFrame) -> None:
         """Save the forecasts with appropriate format."""
         # Required columns
         required_columns = [
-            'ProductId', 'BranchId', 'CountryCode', 'Currency',
-            'EffectiveDate', 'ForecastDate'] + [f"p{int(float(q)*100)}" for q in self.config.quantiles]
+                               'ProductId', 'BranchId', 'CountryCode', 'Currency',
+                               'EffectiveDate', 'ForecastDate'] + self.config.quantiles
+
+        self.logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
+
         for col in required_columns:
             if col not in forecasts_df.columns:
                 raise ValueError(f"Column '{col}' is missing from forecasts DataFrame.")
 
         # Convert date columns to datetime
-        forecasts_df['EffectiveDate'] = pd.to_datetime(forecasts_df['EffectiveDate']).dt.tz_localize(None)
-        forecasts_df['ForecastDate'] = pd.to_datetime(forecasts_df['ForecastDate']).dt.tz_localize(None)
+        forecasts_df['EffectiveDate'] = pd.to_datetime(forecasts_df['EffectiveDate'])
+        forecasts_df['ForecastDate'] = pd.to_datetime(forecasts_df['ForecastDate'])
 
-        # Calculate 'ForecastDay' as the difference in days
-        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
+        # Calculate 'ForecastDay'
+        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] -
+                                       forecasts_df['EffectiveDate']).dt.days + 1
 
-        # Filter out any forecasts that are beyond the forecast horizon
+        # Filter forecasts within horizon
         forecasts_df = forecasts_df[forecasts_df['ForecastDay'] <= self.config.forecast_horizon]
 
         # Pivot the data
         forecasts_pivot = forecasts_df.pivot_table(
             index=['ProductId', 'BranchId', 'CountryCode', 'Currency', 'EffectiveDate'],
             columns='ForecastDay',
-            values=[f"p{int(float(q)*100)}" for q in self.config.quantiles]
+            values=self.config.quantiles
         )
 
         # Flatten the MultiIndex columns
-        forecasts_pivot.columns = [f"{quantile}_Day{int(day)}" for quantile, day in forecasts_pivot.columns]
+        forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
+                                   for quantile, day in forecasts_pivot.columns]
 
-        # Reset index to turn MultiIndex into columns
+        # Reset index
         forecasts_pivot.reset_index(inplace=True)
 
-        # Check for missing columns after flattening
-        expected_columns = [f"p{int(float(q)*100)}_Day{day}" for q in self.config.quantiles for day in
-                            range(1, self.config.forecast_horizon + 1)]
-        missing_columns = [col for col in expected_columns if col not in forecasts_pivot.columns]
-        if missing_columns:
-            self.logger.warning(f"Missing forecast columns after pivot: {missing_columns}")
-            # You may choose to fill missing columns with NaNs or handle accordingly
-
-        # Load the historical data (training data)
+        # Load historical data
         historical_data = pd.read_csv(self.train_file)
-        historical_data['EffectiveDate'] = pd.to_datetime(historical_data['EffectiveDate']).dt.tz_localize(None)
+        historical_data['EffectiveDate'] = pd.to_datetime(historical_data['EffectiveDate'])
 
-        # Ensure necessary columns are present in historical data
-        required_actual_columns = [
-            'ProductId', 'BranchId', 'CountryCode', 'Currency', 'EffectiveDate', 'Demand'
-        ]
-        for col in required_actual_columns:
-            if col not in historical_data.columns:
-                raise ValueError(f"Column '{col}' is missing from historical DataFrame.")
-
-        # Merge actual demand with forecasts
+        # Merge with historical data
         final_df = pd.merge(
             historical_data,
             forecasts_pivot,
@@ -493,7 +530,7 @@ class CashForecastingPipeline:
             how='left'
         )
 
-        # Generate a unique output filename to prevent overwriting (Fix for Issue 13)
+        # Save results
         output_file = f"./results/{country_code}_{self.timestamp}_{strftime('%H%M%S', gmtime())}/final_forecast.csv"
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         final_df.to_csv(output_file, index=False)
@@ -531,6 +568,7 @@ class CashForecastingPipeline:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
             raise
 
+
 def main():
     parser = argparse.ArgumentParser(description='Cash Forecasting Pipeline')
     parser.add_argument('--config', type=str, required=True,
@@ -539,13 +577,20 @@ def main():
                         help='Country codes to process')
     args = parser.parse_args()
 
-    # Load configuration
+    # Load and validate configuration
     with open(args.config, 'r') as f:
         config_dict = yaml.safe_load(f)
-    config = Config(**config_dict)
+
+    try:
+        # First validate with Pydantic
+        config_model = ConfigModel(**config_dict)
+        # Then create Config dataclass
+        config = Config(**config_model.dict())
+    except Exception as e:
+        logging.error(f"Configuration error: {str(e)}")
+        sys.exit(1)
 
     for country_code in args.countries:
-        # Initialize and run pipeline per country to set output_dir correctly (Fix for Issue 1)
         pipeline = CashForecastingPipeline(config)
         try:
             input_file = f"./data/cash/{country_code}.csv"
@@ -556,6 +601,7 @@ def main():
 
         except Exception as e:
             logging.error(f"Failed to process {country_code}: {str(e)}")
+
 
 if __name__ == "__main__":
     main()
