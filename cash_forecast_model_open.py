@@ -263,13 +263,14 @@ class CashForecastingPipeline:
         """Generate multi-step forecasts starting from each EffectiveDate in the training data."""
         # Load inference template
         inference_template = pd.read_csv(template_file)
-        # Remove 'EffectiveDate' from inference_template as it will be set per batch
-        inference_template = inference_template.drop(columns=['EffectiveDate'])
+
+        # Only try to drop EffectiveDate if it exists
+        if 'EffectiveDate' in inference_template.columns:
+            inference_template = inference_template.drop(columns=['EffectiveDate'])
 
         # Load training data to get all EffectiveDates
         training_data = pd.read_csv(self.train_file)
-        training_data['EffectiveDate'] = pd.to_datetime(training_data['EffectiveDate']).dt.tz_localize(None)  # Fix for Issue 10
-
+        training_data['EffectiveDate'] = pd.to_datetime(training_data['EffectiveDate']).dt.tz_localize(None)
         # Get unique EffectiveDates
         effective_dates = sorted(training_data['EffectiveDate'].unique())
 
