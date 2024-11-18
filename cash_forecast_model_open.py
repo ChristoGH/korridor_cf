@@ -1,4 +1,5 @@
 # python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
+# python cs_scripts/reuse_cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM --model-name ZM-model-20241118-121002
 
 import argparse
 import boto3
@@ -18,8 +19,6 @@ import glob  # Fix for Issue 4: Import glob module
 from pydantic import BaseModel, Field, ValidationError  # Need to add ValidationError
 
 
-
-
 class ConfigModel(BaseModel):
     """Pydantic model for configuration validation"""
     region: str
@@ -33,6 +32,7 @@ class ConfigModel(BaseModel):
     batch_size: int = 100
     quantiles: List[str] = ['p10', 'p50', 'p90']
     iterative_forecast_steps: int = 1
+
 
 @dataclass
 class Config:
@@ -48,6 +48,7 @@ class Config:
     batch_size: int = 100
     quantiles: List[str] = ('p10', 'p50', 'p90')
     iterative_forecast_steps: int = 1  # Added to match ConfigModel
+
 
 class CashForecastingPipeline:
     def __init__(self, config: Config):
@@ -119,35 +120,54 @@ class CashForecastingPipeline:
         """Prepare data for training and create inference template."""
         # Load and preprocess data
         data = pd.read_csv(input_file)
-        required_columns = ['ProductId', 'BranchId', 'CountryCode', 'Currency', 'EffectiveDate', 'Demand']
-        for col in required_columns:
-            if col not in data.columns:
-                raise ValueError(f"Input data is missing required column: {col}")  # Fix for Issue 14
 
-        data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate']).dt.tz_localize(None)  # Fix for Issue 10
+        # Initial required columns - basic validation
+        initial_columns = ['ProductId', 'BranchId', 'CountryCode', 'Currency', 'EffectiveDate', 'Demand']
+        for col in initial_columns:
+            if col not in data.columns:
+                raise ValueError(f"Input data is missing required column: {col}")
+
+        # Process dates first since we need it for DayOfWeekName
+        data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate']).dt.tz_localize(None)
         data.sort_values('EffectiveDate', inplace=True)
+
+        # Add derived columns
+        country_names = {'ZM': 'Zambia'}  # Add other countries as needed
+        data['CountryName'] = data['CountryCode'].map(country_names)
+        data['DayOfWeekName'] = data['EffectiveDate'].dt.day_name()
+
+        # Verify all required columns are now present
+        required_columns = ['ProductId', 'BranchId', 'CountryCode', 'CountryName',
+                            'Currency', 'EffectiveDate', 'Demand', 'DayOfWeekName']
+        missing_cols = [col for col in required_columns if col not in data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns after preprocessing: {missing_cols}")
 
         # Create directories for output
         self.output_dir = f"./cs_data/cash/{country_code}_{self.timestamp}"
-        os.makedirs(self.output_dir, exist_ok=True)  # Fix for Issues 1 and 2
+        os.makedirs(self.output_dir, exist_ok=True)
 
         # Define file paths
         train_file = os.path.join(self.output_dir, f"{country_code}_train.csv")
         inference_template_file = os.path.join(self.output_dir, f"{country_code}_inference_template.csv")
 
+        # Ensure column order matches required_columns before saving
+        data = data[required_columns]
+
         # Save training data
         data.to_csv(train_file, index=False)
-        self.train_file = train_file  # Save train file path for later use
+        self.train_file = train_file
 
-        # Create inference template with unique combinations
+        # Create inference template with all necessary columns
         inference_template = data.drop_duplicates(
             subset=['ProductId', 'BranchId', 'CountryCode', 'Currency']
-        )[['ProductId', 'BranchId', 'CountryCode', 'Currency']]
+        )[['ProductId', 'BranchId', 'CountryCode', 'CountryName', 'Currency']]
 
-        # Save inference template without 'EffectiveDate'
         inference_template.to_csv(inference_template_file, index=False)
 
         return train_file, inference_template_file
+
+
 
     def train_model(self, country_code: str, train_data_s3_uri: str) -> str:
         """Train the forecasting model with updated forecast horizon."""
@@ -286,7 +306,8 @@ class CashForecastingPipeline:
 
             for effective_date in batch_dates:
                 # Generate future dates for the forecast horizon
-                future_dates = [effective_date + pd.Timedelta(days=j) for j in range(1, self.config.forecast_horizon + 1)]
+                future_dates = [effective_date + pd.Timedelta(days=j) for j in
+                                range(1, self.config.forecast_horizon + 1)]
 
                 # Number of combinations
                 num_combinations = len(inference_template)
@@ -327,9 +348,10 @@ class CashForecastingPipeline:
 
         return forecast_df
 
-    def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str, batch_number: int) -> None:
+    def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
+                                 batch_number: int) -> None:
         """Run a batch transform job for the given inference data."""
-        transform_job_name = f"{model_name}-transform-{self.timestamp}-{batch_number}"  # Fix for Issue 3
+        transform_job_name = f"{model_name}-transform-{self.timestamp}-{batch_number}"
 
         output_s3_uri = f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
 
@@ -343,8 +365,8 @@ class CashForecastingPipeline:
                     'DataSource': {
                         'S3DataSource': {
                             'S3DataType': 'S3Prefix',
-                            'S3Uri': s3_inference_data_uri,
-                            'S3DataDistributionType': 'FullyReplicated'
+                            'S3Uri': s3_inference_data_uri
+                            # Remove S3DataDistributionType as it's not a valid parameter
                         }
                     },
                     'ContentType': 'text/csv',
@@ -361,10 +383,7 @@ class CashForecastingPipeline:
             )
         except Exception as e:
             self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
-            raise  # Fix for Issue 7: Exception handling for AWS calls
-
-        # Monitor the transform job
-        self._monitor_transform_job(transform_job_name)
+            raise
 
     def _monitor_transform_job(self, transform_job_name: str) -> None:
         """Monitor the batch transform job until completion."""
@@ -379,7 +398,8 @@ class CashForecastingPipeline:
                     if status != 'Completed':
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
-                        raise RuntimeError(f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
+                        raise RuntimeError(
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
                     break
                 sleep(sleep_time)
                 sleep_time = min(sleep_time * 1.5, 600)  # Increase sleep time up to 10 minutes (Fix for Issue 11)
