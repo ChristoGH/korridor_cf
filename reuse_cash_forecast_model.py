@@ -33,7 +33,7 @@ class ConfigModel(BaseModel):
     instance_count: int = 1
     forecast_horizon: int = 10
     forecast_frequency: str = "1D"
-    batch_size: int = 50
+    batch_size: int = 10
     quantiles: List[str] = ['p10', 'p50', 'p90']
 
 
@@ -114,10 +114,24 @@ class ModelReusePipeline:
             if col not in data.columns:
                 raise ValueError(f"Input data is missing required column: {col}")
 
+        # Data validation and cleanup
+        data['Demand'] = pd.to_numeric(data['Demand'], errors='coerce')
+
+        # Log problematic values
+        zeros_mask = data['Demand'] == 0
+        neg_mask = data['Demand'] < 0
+        if zeros_mask.any() or neg_mask.any():
+            self.logger.warning(f"Found {zeros_mask.sum()} zero values and {neg_mask.sum()} negative values in Demand")
+
+        # Replace zeros and negative values with small positive number
+        min_positive_demand = data[data['Demand'] > 0]['Demand'].min()
+        small_value = min_positive_demand * 0.01 if pd.notnull(min_positive_demand) else 0.01
+        data.loc[zeros_mask | neg_mask, 'Demand'] = small_value
+
         # Add CountryName column and log transform Demand
         country_names = {'ZM': 'Zambia'}
         data['CountryName'] = data['CountryCode'].map(country_names)
-        data['Demand'] = np.log1p(data['Demand'])  # Add this line
+        data['Demand'] = np.log1p(data['Demand'])
 
         data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate']).dt.tz_localize(None)
         data['DayOfWeekName'] = data['EffectiveDate'].dt.day_name()
@@ -139,6 +153,7 @@ class ModelReusePipeline:
 
         self.logger.info(f"Data prepared and saved to {data_file} and {inference_template_file}")
         return data_file, inference_template_file
+
 
     def generate_forecasts(self, country_code: str, model_name: str, data_file: str,
                            template_file: str) -> pd.DataFrame:
@@ -211,8 +226,7 @@ class ModelReusePipeline:
                             'Currency', 'EffectiveDate', 'Demand', 'DayOfWeekName']
         inference_data = inference_data[required_columns].copy()
 
-        # Log transform 'Demand' before inference
-        inference_data['Demand'] = np.log1p(inference_data['Demand'])
+        # Remove the duplicate log transform since data is already transformed in prepare_data()
 
         # Save the inference data to a CSV file
         temp_csv = f"temp_inference_{batch_number}.csv"
@@ -300,19 +314,25 @@ class ModelReusePipeline:
                 predictions.append(pred_df)
                 os.remove(local_output_file)  # Clean up the local file
 
-            # Combine all predictions into a single DataFrame
+            # Fix the SettingWithCopyWarning and deprecated applymap
             predictions_df = pd.concat(predictions, ignore_index=True)
-
-            # Adjusting code to handle extra columns in predictions_df
             num_prediction_cols = len(self.config.quantiles)
-            # Assuming the predictions are in the last 'n' columns
-            prediction_columns = predictions_df.iloc[:, -num_prediction_cols:]
-            prediction_columns.columns = self.config.quantiles  # Assign column names as per quantiles
 
-            # Ensure predictions are numeric
+            # Create a new DataFrame instead of modifying a slice
+            prediction_columns = pd.DataFrame(
+                predictions_df.iloc[:, -num_prediction_cols:].values,
+                columns=self.config.quantiles
+            )
+
+            # Clean predictions - ensure non-negative values after inverse transform
             for col in prediction_columns.columns:
                 prediction_columns[col] = pd.to_numeric(prediction_columns[col], errors='coerce')
+                # After inverse transform, replace negative values with 0
+                prediction_columns[col] = np.maximum(0, np.expm1(prediction_columns[col]))
 
+            # Ensure p10 <= p50 <= p90
+            prediction_columns['p10'] = prediction_columns[['p10', 'p50']].min(axis=1)
+            prediction_columns['p90'] = prediction_columns[['p50', 'p90']].max(axis=1)
             # Merge the predictions with the full inference data
             full_inference_data = full_inference_data.reset_index(drop=True)
             results = pd.concat([full_inference_data, prediction_columns], axis=1)
