@@ -114,14 +114,13 @@ class ModelReusePipeline:
             if col not in data.columns:
                 raise ValueError(f"Input data is missing required column: {col}")
 
-        # Add CountryName column
-        country_names = {'ZM': 'Zambia'}  # Add other countries as needed
+        # Add CountryName column and log transform Demand
+        country_names = {'ZM': 'Zambia'}
         data['CountryName'] = data['CountryCode'].map(country_names)
+        data['Demand'] = np.log1p(data['Demand'])  # Add this line
 
         data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate']).dt.tz_localize(None)
-        # Add DayOfWeekName
         data['DayOfWeekName'] = data['EffectiveDate'].dt.day_name()
-
         data.sort_values('EffectiveDate', inplace=True)
 
         self.output_dir = f"./cs_data/cash/{country_code}_{self.timestamp}"
@@ -201,15 +200,25 @@ class ModelReusePipeline:
 
     def _process_forecast_batch(self, country_code: str, model_name: str,
                                 inference_data: pd.DataFrame, batch_number: int) -> pd.DataFrame:
-        """Process using batch transform instead of real-time endpoint"""
+        """Process a single batch of forecasts using SageMaker Batch Transform."""
+        self.logger.info(f"Starting batch transform for batch number {batch_number}")
+
+        # Keep a copy of the full inference data, including 'ForecastDate'
+        full_inference_data = inference_data.copy()
+
+        # Select only the required columns for the model input (exclude 'ForecastDate')
         required_columns = ['BranchId', 'CountryCode', 'CountryName', 'ProductId',
                             'Currency', 'EffectiveDate', 'Demand', 'DayOfWeekName']
         inference_data = inference_data[required_columns].copy()
 
-        temp_csv = f"temp_inference_{batch_number}.csv"
-        inference_data.to_csv(temp_csv, index=False, header=True)
+        # Log transform 'Demand' before inference
+        inference_data['Demand'] = np.log1p(inference_data['Demand'])
 
-        # Use consistent path structure
+        # Save the inference data to a CSV file
+        temp_csv = f"temp_inference_{batch_number}.csv"
+        inference_data.to_csv(temp_csv, index=False, header=False)  # Save without header for consistency
+
+        # Define S3 paths
         input_prefix = f"{self.config.prefix}-{country_code}/inference"
         output_prefix = f"{self.config.prefix}-{country_code}/output"
 
@@ -219,6 +228,7 @@ class ModelReusePipeline:
         transform_job_name = f"{model_name}-transform-{self.timestamp}-{batch_number}"
 
         try:
+            # Create the batch transform job
             self.sm_client.create_transform_job(
                 TransformJobName=transform_job_name,
                 ModelName=model_name,
@@ -229,14 +239,14 @@ class ModelReusePipeline:
                     'DataSource': {
                         'S3DataSource': {
                             'S3DataType': 'S3Prefix',
-                            'S3Uri': f"s3://{self.config.bucket}/{input_prefix}/"
+                            'S3Uri': f"s3://{self.config.bucket}/{s3_input_key}"
                         }
                     },
                     'ContentType': 'text/csv',
                     'SplitType': 'Line'
                 },
                 TransformOutput={
-                    'S3OutputPath': f"s3://{self.config.bucket}/{output_prefix}/",
+                    'S3OutputPath': f"s3://{self.config.bucket}/{output_prefix}/batch_{batch_number}/",
                     'Accept': 'text/csv',
                     'AssembleWith': 'Line'
                 },
@@ -246,62 +256,93 @@ class ModelReusePipeline:
                 }
             )
 
-            # Monitor job status
-            retry_delay = 30
-            max_retries = 10
-            retries = 0
+            # Monitor the transform job
+            self.logger.info(f"Waiting for transform job {transform_job_name} to complete...")
+            waiter = self.sm_client.get_waiter('transform_job_completed_or_stopped')
+            waiter.wait(TransformJobName=transform_job_name)
+            self.logger.info(f"Transform job {transform_job_name} completed.")
 
-            while retries < max_retries:
-                response = self.sm_client.describe_transform_job(TransformJobName=transform_job_name)
-                status = response['TransformJobStatus']
-                self.logger.info(f"Transform job status: {status}")
+            # Check the final status
+            response = self.sm_client.describe_transform_job(TransformJobName=transform_job_name)
+            status = response['TransformJobStatus']
+            if status != 'Completed':
+                failure_reason = response.get('FailureReason', 'Unknown')
+                raise Exception(f"Transform job failed with status {status}: {failure_reason}")
 
-                if status == 'Completed':
-                    break
-                elif status in ['Failed', 'Stopped']:
-                    failure_reason = response.get('FailureReason', 'Unknown reason')
-                    raise Exception(f"Transform job failed: {failure_reason}")
+            # Download the output from S3
+            s3_output_prefix = f"{output_prefix}/batch_{batch_number}/"
+            output_objects = self.s3_client.list_objects_v2(
+                Bucket=self.config.bucket,
+                Prefix=s3_output_prefix
+            )
 
-                retries += 1
-                sleep(min(retry_delay * (2 ** retries), 300))
-
-                if retries == max_retries:
-                    raise Exception("Maximum retries reached waiting for transform job")
-
-            # List objects in output prefix to find the results
-            paginator = self.s3_client.get_paginator('list_objects_v2')
+            # Collect all output files
             output_files = []
-
-            for page in paginator.paginate(
-                    Bucket=self.config.bucket,
-                    Prefix=f"{output_prefix}/batch_{batch_number}"
-            ):
-                if 'Contents' in page:
-                    output_files.extend(page['Contents'])
+            for obj in output_objects.get('Contents', []):
+                key = obj['Key']
+                if key.endswith('.csv.out'):
+                    output_files.append(key)
 
             if not output_files:
-                raise FileNotFoundError(f"No output files found in {output_prefix}")
+                raise FileNotFoundError(f"No output files found for transform job {transform_job_name}")
 
-            # Download the first matching output file
-            output_key = output_files[0]['Key']
-            local_output = f"output_{batch_number}.csv"
-            self.s3_client.download_file(self.config.bucket, output_key, local_output)
+            # Download and concatenate all output files
+            predictions = []
+            for output_key in output_files:
+                local_output_file = f"output_{batch_number}_{os.path.basename(output_key)}"
+                self.s3_client.download_file(self.config.bucket, output_key, local_output_file)
+                pred_df = pd.read_csv(local_output_file, header=None)
 
-            results = pd.read_csv(local_output)
+                # Clean and convert predictions to numeric
+                pred_df = pred_df.applymap(lambda x: x.strip().strip('"') if isinstance(x, str) else x)
+                pred_df = pred_df.apply(pd.to_numeric, errors='coerce')
 
-            # Cleanup
-            os.remove(local_output)
+                predictions.append(pred_df)
+                os.remove(local_output_file)  # Clean up the local file
+
+            # Combine all predictions into a single DataFrame
+            predictions_df = pd.concat(predictions, ignore_index=True)
+
+            # Adjusting code to handle extra columns in predictions_df
+            num_prediction_cols = len(self.config.quantiles)
+            # Assuming the predictions are in the last 'n' columns
+            prediction_columns = predictions_df.iloc[:, -num_prediction_cols:]
+            prediction_columns.columns = self.config.quantiles  # Assign column names as per quantiles
+
+            # Ensure predictions are numeric
+            for col in prediction_columns.columns:
+                prediction_columns[col] = pd.to_numeric(prediction_columns[col], errors='coerce')
+
+            # Merge the predictions with the full inference data
+            full_inference_data = full_inference_data.reset_index(drop=True)
+            results = pd.concat([full_inference_data, prediction_columns], axis=1)
+
+            # Compute 'horizon_day'
+            results['horizon_day'] = (pd.to_datetime(results['ForecastDate']) -
+                                      pd.to_datetime(results['EffectiveDate'])).dt.days + 1
+
+            # Inverse log transform the predictions
+            for col in self.config.quantiles:
+                results[col] = np.expm1(results[col])
+
+            # Select and reorder the desired columns
+            results = results[['BranchId', 'CountryCode', 'CountryName', 'ProductId', 'Currency',
+                               'EffectiveDate', 'ForecastDate'] + self.config.quantiles + ['horizon_day']]
+
+            # Cleanup temporary files
             os.remove(temp_csv)
 
-            self.logger.info(f"Batch {batch_number} processed successfully")
+            self.logger.info(f"Batch {batch_number} processed successfully.")
+            self.logger.info(f"Results columns: {results.columns.tolist()}")
+            self.logger.info(f"Sample results:\n{results.head()}")
+
             return results
 
         except Exception as e:
-            self.logger.error(f"Error in batch transform: {str(e)}")
+            self.logger.error(f"Error in batch transform for batch {batch_number}: {str(e)}")
             if os.path.exists(temp_csv):
                 os.remove(temp_csv)
             raise
-
 
     def _save_results(self, country_code: str, forecasts: pd.DataFrame,
                       historical_data: pd.DataFrame) -> None:
