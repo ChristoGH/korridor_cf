@@ -16,6 +16,8 @@ import yaml
 import tempfile
 import glob  # Fix for Issue 4: Import glob module
 from pydantic import BaseModel, Field, ValidationError  # Need to add ValidationError
+import shutil
+
 
 
 class ConfigModel(BaseModel):
@@ -259,7 +261,8 @@ class CashForecastingPipeline:
             raise  # Fix for Issue 7: Exception handling for AWS calls
         return model_name
 
-    def forecast(self, country_code: str, model_name: str, template_file: str) -> pd.DataFrame:
+    def forecast(self, country_code: str, model_name: str, template_file: str,
+                 backtesting: bool = False) -> pd.DataFrame:
         """Generate multi-step forecasts starting from each EffectiveDate in the training data."""
         # Load inference template
         inference_template = pd.read_csv(template_file)
@@ -268,11 +271,16 @@ class CashForecastingPipeline:
         if 'EffectiveDate' in inference_template.columns:
             inference_template = inference_template.drop(columns=['EffectiveDate'])
 
-        # Load training data to get all EffectiveDates
+        # Load training data to get EffectiveDates
         training_data = pd.read_csv(self.train_file)
         training_data['EffectiveDate'] = pd.to_datetime(training_data['EffectiveDate']).dt.tz_localize(None)
-        # Get unique EffectiveDates
-        effective_dates = sorted(training_data['EffectiveDate'].unique())
+
+        if backtesting:
+            # Use past EffectiveDates for backtesting
+            effective_dates = sorted(training_data['EffectiveDate'].unique())
+        else:
+            # Use only the most recent date
+            effective_dates = [training_data['EffectiveDate'].max()]
 
         # Define batch size
         batch_size = self.config.batch_size  # Use batch_size from config (Fix for Issue 8)
@@ -361,6 +369,8 @@ class CashForecastingPipeline:
                     'InstanceCount': self.config.instance_count
                 }
             )
+            self._monitor_transform_job(transform_job_name)
+
         except Exception as e:
             self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
             raise
@@ -401,7 +411,12 @@ class CashForecastingPipeline:
 
         # Create a temporary directory
         temp_dir = f"./temp/{country_code}_{self.timestamp}/"
-        os.makedirs(temp_dir, exist_ok=True)
+        # Cleanup
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
 
         try:
             # Download and process forecast files
@@ -499,8 +514,11 @@ class CashForecastingPipeline:
         forecasts_df['ForecastDate'] = pd.to_datetime(forecasts_df['ForecastDate'])
 
         # Calculate 'ForecastDay'
-        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] -
-                                       forecasts_df['EffectiveDate']).dt.days + 1
+        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
+
+        # Filter forecasts within horizon
+        forecasts_df = forecasts_df[
+            (forecasts_df['ForecastDay'] >= 1) & (forecasts_df['ForecastDay'] <= self.config.forecast_horizon)]
 
         # Filter forecasts within horizon
         forecasts_df = forecasts_df[forecasts_df['ForecastDay'] <= self.config.forecast_horizon]
@@ -537,7 +555,8 @@ class CashForecastingPipeline:
         final_df.to_csv(output_file, index=False)
         self.logger.info(f"Final forecast saved to {output_file}")
 
-    def run_pipeline(self, country_code: str, input_file: str) -> None:
+    def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False) -> None:
+
         """Run the complete forecasting pipeline with multi-step forecasting."""
         try:
             # Prepare data
@@ -563,7 +582,8 @@ class CashForecastingPipeline:
             model_name = self._get_best_model(job_name, country_code)
 
             # Multi-step Forecasting
-            self.forecast(country_code, model_name, template_file)
+            self.forecast(country_code, model_name, template_file, backtesting=backtesting)
+
 
         except Exception as e:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
@@ -598,7 +618,8 @@ def main():
             if not os.path.exists(input_file):
                 raise FileNotFoundError(f"Input file not found: {input_file}")
 
-            pipeline.run_pipeline(country_code, input_file)
+            # pipeline.run_pipeline(country_code, input_file)
+            pipeline.run_pipeline(country_code, input_file, backtesting=False)
 
         except Exception as e:
             logging.error(f"Failed to process {country_code}: {str(e)}")
