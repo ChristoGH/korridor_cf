@@ -43,7 +43,7 @@ class Config:
     forecast_horizon: int = 10
     forecast_frequency: str = "1D"
     batch_size: int = 100
-    quantiles: List[str] = ('p10', 'p50', 'p90')
+    quantiles: List[str] = ['p10', 'p50', 'p90']
 
 
 class CashForecastingPipeline:
@@ -422,8 +422,17 @@ class CashForecastingPipeline:
             # Combine forecast data
             forecast_df = pd.concat(forecast_data, ignore_index=True)
 
-            # Assign quantile columns
-            forecast_df.columns = self.config.quantiles
+            # Determine the number of quantiles
+            num_quantiles = len(self.config.quantiles)
+
+            # Ensure the forecast_df has enough columns
+            if forecast_df.shape[1] < num_quantiles:
+                raise ValueError(
+                    f"Forecast output has {forecast_df.shape[1]} columns, expected at least {num_quantiles}.")
+
+            # Extract only the quantile columns (assumed to be the last columns)
+            forecast_quantiles = forecast_df.iloc[:, -num_quantiles:]
+            forecast_quantiles.columns = self.config.quantiles
 
             # Load and combine inference data
             inference_files = glob.glob(os.path.join(self.output_dir, f"{country_code}_inference_batch_*.csv"))
@@ -452,14 +461,14 @@ class CashForecastingPipeline:
                 if date_col in inference_data.columns:
                     inference_data[date_col] = pd.to_datetime(inference_data[date_col]).dt.tz_localize(None)
 
-            # Combine inference data with forecasts
-            forecast_df = pd.concat([
-                inference_data[['ProductId', 'BranchId', 'Currency',
-                                'EffectiveDate', 'ForecastDate']].reset_index(drop=True),
-                forecast_df.reset_index(drop=True)
+            # Combine inference data with forecast quantiles
+            forecast_df_final = pd.concat([
+                inference_data[['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'ForecastDate']].reset_index(
+                    drop=True),
+                forecast_quantiles.reset_index(drop=True)
             ], axis=1)
 
-            return forecast_df
+            return forecast_df_final
 
         except Exception as e:
             self.logger.error(f"Error in _get_forecast_result: {str(e)}")
@@ -478,6 +487,7 @@ class CashForecastingPipeline:
         required_columns = [
             'ProductId', 'BranchId', 'Currency',
             'EffectiveDate', 'ForecastDate'] + self.config.quantiles
+
 
         self.logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
 
@@ -503,7 +513,7 @@ class CashForecastingPipeline:
             values=self.config.quantiles
         )
 
-        # Flatten the MultiIndex columns
+
         forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
                                    for quantile, day in forecasts_pivot.columns]
 
