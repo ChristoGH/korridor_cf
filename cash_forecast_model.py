@@ -509,9 +509,8 @@ class CashForecastingPipeline:
         """Save the forecasts with appropriate format."""
         # Required columns
         required_columns = [
-            'ProductId', 'BranchId', 'Currency',
-            'EffectiveDate', 'ForecastDate'] + self.config.quantiles
-
+                               'ProductId', 'BranchId', 'Currency',
+                               'EffectiveDate', 'ForecastDate'] + self.config.quantiles
 
         self.logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
 
@@ -523,6 +522,14 @@ class CashForecastingPipeline:
         forecasts_df['EffectiveDate'] = pd.to_datetime(forecasts_df['EffectiveDate'])
         forecasts_df['ForecastDate'] = pd.to_datetime(forecasts_df['ForecastDate'])
 
+        # Ensure quantile columns are numeric
+        try:
+            forecasts_df[self.config.quantiles] = forecasts_df[self.config.quantiles].apply(pd.to_numeric,
+                                                                                            errors='coerce')
+        except Exception as e:
+            self.logger.error(f"Failed to convert quantile columns to numeric: {e}")
+            raise ValueError("Quantile columns contain non-numeric values.")
+
         # Calculate 'ForecastDay'
         forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
 
@@ -531,13 +538,18 @@ class CashForecastingPipeline:
             (forecasts_df['ForecastDay'] >= 1) & (forecasts_df['ForecastDay'] <= self.config.forecast_horizon)]
 
         # Pivot the data
-        forecasts_pivot = forecasts_df.pivot_table(
-            index=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
-            columns='ForecastDay',
-            values=self.config.quantiles
-        )
+        try:
+            forecasts_pivot = forecasts_df.pivot_table(
+                index=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
+                columns='ForecastDay',
+                values=self.config.quantiles,
+                aggfunc='mean'  # Explicitly specify the aggregation function
+            )
+        except Exception as e:
+            self.logger.error(f"Pivot table aggregation failed: {e}")
+            raise ValueError("Aggregation function failed due to non-numeric quantile columns.")
 
-
+        # Rename columns to include quantile and day information
         forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
                                    for quantile, day in forecasts_pivot.columns]
 
