@@ -15,6 +15,7 @@ import yaml
 import glob
 from pydantic import BaseModel, ValidationError
 import shutil
+from dataclasses import dataclass, field
 
 
 class ConfigModel(BaseModel):
@@ -43,7 +44,7 @@ class Config:
     forecast_horizon: int = 10
     forecast_frequency: str = "1D"
     batch_size: int = 100
-    quantiles: List[str] = ['p10', 'p50', 'p90']
+    quantiles: List[str] = field(default_factory=lambda: ['p10', 'p50', 'p90'])
 
 
 class CashForecastingPipeline:
@@ -407,10 +408,36 @@ class CashForecastingPipeline:
                     local_file = os.path.join(temp_dir, os.path.basename(s3_key))
                     try:
                         self.s3_client.download_file(self.config.bucket, s3_key, local_file)
-                        df = pd.read_csv(local_file, header=None)
-                        forecast_data.append(df)
+
+                        # Read the first few lines to analyze the structure
+                        with open(local_file, 'r') as f:
+                            first_lines = [next(f) for _ in range(5)]
+
+                        # Determine number of columns from first line
+                        num_columns = len(first_lines[0].strip().split(','))
+                        self.logger.info(f"Found {num_columns} columns in forecast output")
+
+                        # Read with pandas, explicitly creating column names
+                        df = pd.read_csv(local_file, header=None,
+                                         names=[f'forecast_{i}' for i in range(num_columns)])
+
+                        # Detect the actual forecast columns based on numeric content
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns
+                        self.logger.info(f"Found {len(numeric_cols)} numeric columns")
+
+                        if len(numeric_cols) >= len(self.config.quantiles):
+                            # Take the last n columns where n is the number of quantiles
+                            forecast_cols = numeric_cols[-len(self.config.quantiles):]
+                            df_subset = df[forecast_cols]
+                            df_subset.columns = self.config.quantiles
+                            forecast_data.append(df_subset)
+                        else:
+                            raise ValueError(
+                                f"Found {len(numeric_cols)} numeric columns, expected at least {len(self.config.quantiles)}")
+
                     except Exception as e:
                         self.logger.error(f"Failed to process {s3_key}: {e}")
+                        self.logger.error(f"File content preview: {first_lines[:2]}")
                         continue
                     finally:
                         if os.path.exists(local_file):
@@ -421,18 +448,6 @@ class CashForecastingPipeline:
 
             # Combine forecast data
             forecast_df = pd.concat(forecast_data, ignore_index=True)
-
-            # Determine the number of quantiles
-            num_quantiles = len(self.config.quantiles)
-
-            # Ensure the forecast_df has enough columns
-            if forecast_df.shape[1] < num_quantiles:
-                raise ValueError(
-                    f"Forecast output has {forecast_df.shape[1]} columns, expected at least {num_quantiles}.")
-
-            # Extract only the quantile columns (assumed to be the last columns)
-            forecast_quantiles = forecast_df.iloc[:, -num_quantiles:]
-            forecast_quantiles.columns = self.config.quantiles
 
             # Load and combine inference data
             inference_files = glob.glob(os.path.join(self.output_dir, f"{country_code}_inference_batch_*.csv"))
@@ -447,9 +462,6 @@ class CashForecastingPipeline:
                 except Exception as e:
                     self.logger.error(f"Failed to read inference file {file}: {e}")
                     continue
-                finally:
-                    if os.path.exists(file):
-                        os.remove(file)
 
             if not inference_data_list:
                 raise ValueError("No valid inference data found")
@@ -461,17 +473,29 @@ class CashForecastingPipeline:
                 if date_col in inference_data.columns:
                     inference_data[date_col] = pd.to_datetime(inference_data[date_col]).dt.tz_localize(None)
 
-            # Combine inference data with forecast quantiles
-            forecast_df_final = pd.concat([
-                inference_data[['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'ForecastDate']].reset_index(
-                    drop=True),
-                forecast_quantiles.reset_index(drop=True)
+            # Verify row counts match
+            if len(forecast_df) != len(inference_data):
+                self.logger.warning(
+                    f"Row count mismatch: forecast_df={len(forecast_df)}, inference_data={len(inference_data)}")
+                # Align the data
+                min_rows = min(len(forecast_df), len(inference_data))
+                forecast_df = forecast_df.iloc[:min_rows]
+                inference_data = inference_data.iloc[:min_rows]
+
+            # Combine inference data with forecasts
+            result_df = pd.concat([
+                inference_data[['ProductId', 'BranchId', 'Currency',
+                                'EffectiveDate', 'ForecastDate']].reset_index(drop=True),
+                forecast_df.reset_index(drop=True)
             ], axis=1)
 
-            return forecast_df_final
+            return result_df
 
         except Exception as e:
             self.logger.error(f"Error in _get_forecast_result: {str(e)}")
+            self.logger.error(f"Forecast shape: {forecast_df.shape if 'forecast_df' in locals() else 'not created'}")
+            self.logger.error(
+                f"Inference shape: {inference_data.shape if 'inference_data' in locals() else 'not created'}")
             raise
         finally:
             # Cleanup
