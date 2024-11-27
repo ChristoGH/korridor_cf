@@ -16,6 +16,7 @@ import glob
 from pydantic import BaseModel, ValidationError
 import shutil
 from dataclasses import dataclass, field
+import json
 
 
 class ConfigModel(BaseModel):
@@ -445,6 +446,19 @@ class CashForecastingPipeline:
 
     def _get_forecast_result(self, country_code: str) -> pd.DataFrame:
         """Download and process forecast results."""
+        # Load scaling parameters at start
+        scaling_file = os.path.join(self.output_dir, f"{country_code}_scaling_params.json")
+        try:
+            with open(scaling_file, 'r') as f:
+                serialized_params = json.load(f)
+                scaling_params = {
+                    tuple(k.split('_')): v
+                    for k, v in serialized_params.items()
+                }
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"Scaling parameters not found at {scaling_file}. Model requires scaling parameters from training.")
+
         output_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
         try:
             response = self.s3_client.list_objects_v2(Bucket=self.config.bucket, Prefix=output_s3_prefix)
@@ -549,6 +563,59 @@ class CashForecastingPipeline:
                 forecast_df.reset_index(drop=True)
             ], axis=1)
 
+            # After creating result_df but before returning
+            self.logger.info("Restoring original scale to forecasts...")
+
+            # Create a copy to preserve scaled values
+            result_df_scaled = result_df.copy()
+
+            # Restore scaling for each group
+            for (currency, branch), params in scaling_params.items():
+                mask = (result_df['Currency'] == currency) & (result_df['BranchId'] == branch)
+                if mask.sum() == 0:
+                    self.logger.warning(f"No forecasts found for Currency={currency}, Branch={branch}")
+                    continue
+
+                # Inverse transform the forecasts for each quantile
+                for quantile in self.config.quantiles:
+                    result_df.loc[mask, quantile] = (
+                            (result_df.loc[mask, quantile] *
+                             (params['std'] if params['std'] != 0 else 1)) +
+                            params['mean']
+                    )
+
+                # Validate the scaling restoration
+                for quantile in self.config.quantiles:
+                    scaled_stats = result_df_scaled.loc[mask, quantile].describe()
+                    restored_stats = result_df.loc[mask, quantile].describe()
+
+                    self.logger.info(
+                        f"Scaling restoration for {currency}-{branch} {quantile}:\n"
+                        f"  Scaled   -> mean: {scaled_stats['mean']:.2f}, std: {scaled_stats['std']:.2f}\n"
+                        f"  Restored -> mean: {restored_stats['mean']:.2f}, std: {restored_stats['std']:.2f}\n"
+                        f"  Expected -> mean: {params['mean']:.2f}, std: {params['std']:.2f}"
+                    )
+
+                    # Check for anomalies
+                    if restored_stats['min'] < 0:
+                        self.logger.warning(
+                            f"Negative values in restored forecasts for {currency}-{branch} {quantile}: "
+                            f"min={restored_stats['min']:.2f}"
+                        )
+
+                    # Check for extreme values (> 5 std from mean)
+                    zscore = np.abs((result_df.loc[mask, quantile] - params['mean']) / params['std'])
+                    outliers = (zscore > 5).sum()
+                    if outliers > 0:
+                        self.logger.warning(
+                            f"{outliers} extreme outliers in restored forecasts for "
+                            f"{currency}-{branch} {quantile} (>5 std from mean)"
+                        )
+
+            # Add scaling metadata to result
+            result_df.attrs['scaling_restored'] = True
+            result_df.attrs['scaling_timestamp'] = self.timestamp
+
             return result_df
 
         except Exception as e:
@@ -564,6 +631,7 @@ class CashForecastingPipeline:
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
+
 
     def _save_forecasts(self, country_code: str, forecasts_df: pd.DataFrame) -> None:
         """Save the forecasts with appropriate format."""
