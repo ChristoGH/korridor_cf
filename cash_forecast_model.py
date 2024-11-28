@@ -363,7 +363,7 @@ class CashForecastingPipeline:
                 inference_data_list.append(temp_df)
 
             # Combine batch inference data
-            inference_data = pd.concat(inference_data_list, ignore_index=True)
+            inference_data = pd.concat(inference_data_list, ignore_index=True).drop(columns=['Demand'])
 
             # Save to CSV using self.output_dir
             inference_file = os.path.join(self.output_dir, f"{country_code}_inference_batch_{batch_number}.csv")
@@ -417,6 +417,7 @@ class CashForecastingPipeline:
                     'InstanceCount': self.config.instance_count
                 }
             )
+            self.logger.info(f"Created transform job {transform_job_name}")
             self._monitor_transform_job(transform_job_name)
         except Exception as e:
             self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
@@ -506,8 +507,11 @@ class CashForecastingPipeline:
                             df_subset.columns = self.config.quantiles
                             forecast_data.append(df_subset)
                         else:
-                            raise ValueError(
+                            # Log detailed error and skip this file
+                            self.logger.error(
                                 f"Found {len(numeric_cols)} numeric columns, expected at least {len(self.config.quantiles)}")
+                            self.logger.error(f"File content preview: {first_lines[:2]}")
+                            continue
 
                     except Exception as e:
                         self.logger.error(f"Failed to process {s3_key}: {e}")
@@ -578,14 +582,23 @@ class CashForecastingPipeline:
 
                 # Inverse transform the forecasts for each quantile
                 for quantile in self.config.quantiles:
-                    result_df.loc[mask, quantile] = (
-                            (result_df.loc[mask, quantile] *
-                             (params['std'] if params['std'] != 0 else 1)) +
-                            params['mean']
-                    )
+                    if quantile in result_df.columns:
+                        result_df.loc[mask, quantile] = (
+                                (result_df.loc[mask, quantile] *
+                                 (params['std'] if params['std'] != 0 else 1)) +
+                                params['mean']
+                        )
+                        self.logger.info(
+                            f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
 
                 # Validate the scaling restoration
                 for quantile in self.config.quantiles:
+                    if quantile not in result_df.columns:
+                        continue
                     scaled_stats = result_df_scaled.loc[mask, quantile].describe()
                     restored_stats = result_df.loc[mask, quantile].describe()
 
@@ -604,13 +617,14 @@ class CashForecastingPipeline:
                         )
 
                     # Check for extreme values (> 5 std from mean)
-                    zscore = np.abs((result_df.loc[mask, quantile] - params['mean']) / params['std'])
-                    outliers = (zscore > 5).sum()
-                    if outliers > 0:
-                        self.logger.warning(
-                            f"{outliers} extreme outliers in restored forecasts for "
-                            f"{currency}-{branch} {quantile} (>5 std from mean)"
-                        )
+                    if params['std'] != 0:
+                        zscore = np.abs((result_df.loc[mask, quantile] - params['mean']) / params['std'])
+                        outliers = (zscore > 5).sum()
+                        if outliers > 0:
+                            self.logger.warning(
+                                f"{outliers} extreme outliers in restored forecasts for "
+                                f"{currency}-{branch} {quantile} (>5 std from mean)"
+                            )
 
             # Add scaling metadata to result
             result_df.attrs['scaling_restored'] = True
@@ -619,7 +633,7 @@ class CashForecastingPipeline:
             return result_df
 
         except Exception as e:
-            self.logger.error(f"Error in _get_forecast_result: {str(e)}")
+            self.logger.error(f"Error in _get_forecast_result: {e}")
             self.logger.error(f"Forecast shape: {forecast_df.shape if 'forecast_df' in locals() else 'not created'}")
             self.logger.error(
                 f"Inference shape: {inference_data.shape if 'inference_data' in locals() else 'not created'}")
@@ -631,7 +645,6 @@ class CashForecastingPipeline:
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
-
 
     def _save_forecasts(self, country_code: str, forecasts_df: pd.DataFrame) -> None:
         """Save the forecasts with appropriate format."""
