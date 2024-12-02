@@ -384,110 +384,112 @@ class CashForecastingInference:
         raise TimeoutError(f"Transform job {transform_job_name} did not complete within {max_wait_time} seconds.")
 
     def _get_forecast_result(self, country_code: str, inference_df: pd.DataFrame) -> pd.DataFrame:
-        def _get_forecast_result(self, country_code: str, inference_df: pd.DataFrame) -> pd.DataFrame:
-            """Download and process forecast results."""
-            output_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
-            try:
-                response = self.s3_client.list_objects_v2(Bucket=self.config.bucket, Prefix=output_s3_prefix)
-            except Exception as e:
-                self.logger.error(f"Failed to list objects in S3: {e}")
-                raise
+        """Download and process forecast results."""
+        output_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
+        try:
+            response = self.s3_client.list_objects_v2(Bucket=self.config.bucket, Prefix=output_s3_prefix)
+        except Exception as e:
+            self.logger.error(f"Failed to list objects in S3: {e}")
+            raise
 
-            if 'Contents' not in response:
-                raise FileNotFoundError(f"No inference results found in S3 for {output_s3_prefix}")
+        if 'Contents' not in response:
+            raise FileNotFoundError(f"No inference results found in S3 for {output_s3_prefix}")
 
-            # Create a temporary directory
-            temp_dir = f"./temp/{country_code}_{self.timestamp}/"
-            os.makedirs(temp_dir, exist_ok=True)
+        # Create a temporary directory
+        temp_dir = f"./temp/{country_code}_{self.timestamp}/"
+        os.makedirs(temp_dir, exist_ok=True)
 
-            try:
-                # Download and process forecast files
-                forecast_data = []
-                for obj in response['Contents']:
-                    s3_key = obj['Key']
-                    if s3_key.endswith('.out'):
-                        local_file = os.path.join(temp_dir, os.path.basename(s3_key))
-                        try:
-                            self.s3_client.download_file(self.config.bucket, s3_key, local_file)
-                            self.logger.info(f"Downloaded forecast file {s3_key} to {local_file}")
-
-                            # Read forecast data
-                            df = pd.read_csv(local_file)
-                            forecast_data.append(df)
-                        except Exception as e:
-                            self.logger.error(f"Failed to process {s3_key}: {e}")
-                            continue
-                        finally:
-                            if os.path.exists(local_file):
-                                os.remove(local_file)
-
-                if not forecast_data:
-                    raise FileNotFoundError("No forecast output files found.")
-
-                # Combine forecast data
-                forecast_df = pd.concat(forecast_data, ignore_index=True)
-                self.logger.info(f"Combined forecast data shape: {forecast_df.shape}")
-
-                # Validate data lengths and combine with inference data
-                if len(forecast_df) != len(inference_df):
-                    self.logger.error(f"Mismatch between inference data and forecast results. "
-                                      f"Inference records: {len(inference_df)}, Forecast records: {len(forecast_df)}")
-                    raise ValueError("Mismatch between inference data and forecast results.")
-
-                # Reset indices to align DataFrames correctly
-                forecast_df.reset_index(drop=True, inplace=True)
-                inference_df.reset_index(drop=True, inplace=True)
-
-                # Merge forecast_df with inference_df including all necessary columns
-                forecast_df = pd.concat([
-                    inference_df[['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'ForecastDate']],
-                    forecast_df
-                ], axis=1)
-
-                # Log the columns to verify merge result
-                self.logger.info(f"Forecast df columns after merge: {forecast_df.columns.tolist()}")
-
-                # Ensure correct data types
-                forecast_df['ProductId'] = forecast_df['ProductId'].astype(str)
-                forecast_df['BranchId'] = forecast_df['BranchId'].astype(str)
-                forecast_df['Currency'] = forecast_df['Currency'].astype(str)
-
-                # Inverse scaling
-                self.logger.info("Restoring original scale to forecasts...")
-                for (currency, branch), params in self.scaling_params.items():
-                    mask = (forecast_df['Currency'] == currency) & (forecast_df['BranchId'] == branch)
-                    if mask.sum() == 0:
-                        self.logger.warning(f"No forecasts found for Currency={currency}, Branch={branch}")
-                        continue
-
-                    for quantile in self.config.quantiles:
-                        if quantile in forecast_df.columns:
-                            forecast_df.loc[mask, quantile] = (
-                                    (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
-                                    params['mean']
-                            )
-                            self.logger.info(
-                                f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}"
-                            )
-                        else:
-                            self.logger.warning(
-                                f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
-
-                self.logger.info("Inverse scaling completed successfully.")
-                return forecast_df
-
-            except Exception as e:
-                self.logger.error(f"Error in _get_forecast_result: {e}")
-                raise
-            finally:
-                # Cleanup
-                if os.path.exists(temp_dir):
+        try:
+            # Download and process forecast files
+            forecast_data = []
+            for obj in response['Contents']:
+                s3_key = obj['Key']
+                if s3_key.endswith('.out'):
+                    local_file = os.path.join(temp_dir, os.path.basename(s3_key))
                     try:
-                        shutil.rmtree(temp_dir)
-                        self.logger.info(f"Removed temporary directory {temp_dir}")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
+                        self.s3_client.download_file(self.config.bucket, s3_key, local_file)
+                        self.logger.info(f"Downloaded forecast file {s3_key} to {local_file}")
 
+                        # Read forecast data
+                        df = pd.read_csv(local_file)
+                        forecast_data.append(df)
+                    except Exception as e:
+                        self.logger.error(f"Failed to process {s3_key}: {e}")
+                        continue
+                    finally:
+                        if os.path.exists(local_file):
+                            os.remove(local_file)
+
+            if not forecast_data:
+                raise FileNotFoundError("No forecast output files found.")
+
+            # Combine forecast data
+            forecast_df = pd.concat(forecast_data, ignore_index=True)
+            self.logger.info(f"Combined forecast data shape: {forecast_df.shape}")
+
+            # Validate data lengths
+            if len(forecast_df) != len(inference_df):
+                self.logger.error(f"Mismatch between inference data and forecast results. "
+                                  f"Inference records: {len(inference_df)}, Forecast records: {len(forecast_df)}")
+                raise ValueError("Mismatch between inference data and forecast results.")
+
+            # Reset indices to align DataFrames correctly
+            forecast_df.reset_index(drop=True, inplace=True)
+            inference_df.reset_index(drop=True, inplace=True)
+
+            # Identify forecast columns (assuming they are not in inference_df)
+            forecast_columns = [col for col in forecast_df.columns if col not in inference_df.columns]
+
+            # Assign forecast columns to inference_df
+            for col in forecast_columns:
+                inference_df[col] = forecast_df[col]
+
+            # Now inference_df contains all the necessary data
+            forecast_df = inference_df
+
+            # Log the columns to verify merge result
+            self.logger.info(f"Forecast df columns after merging: {forecast_df.columns.tolist()}")
+
+            # Ensure correct data types
+            forecast_df['ProductId'] = forecast_df['ProductId'].astype(str)
+            forecast_df['BranchId'] = forecast_df['BranchId'].astype(str)
+            forecast_df['Currency'] = forecast_df['Currency'].astype(str)
+
+            # Inverse scaling
+            self.logger.info("Restoring original scale to forecasts...")
+            for (currency, branch), params in self.scaling_params.items():
+                mask = (forecast_df['Currency'] == currency) & (forecast_df['BranchId'] == branch)
+                if mask.sum() == 0:
+                    self.logger.warning(f"No forecasts found for Currency={currency}, Branch={branch}")
+                    continue
+
+                for quantile in self.config.quantiles:
+                    if quantile in forecast_df.columns:
+                        forecast_df.loc[mask, quantile] = (
+                                (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
+                                params['mean']
+                        )
+                        self.logger.info(
+                            f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
+
+            self.logger.info("Inverse scaling completed successfully.")
+            return forecast_df
+
+        except Exception as e:
+            self.logger.error(f"Error in _get_forecast_result: {e}", exc_info=True)
+            raise
+        finally:
+            # Cleanup
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    self.logger.info(f"Removed temporary directory {temp_dir}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
 
     def _generate_statistical_report(self, result_df: pd.DataFrame, country_code: str) -> None:
         """Generate detailed statistical report for forecasts."""
