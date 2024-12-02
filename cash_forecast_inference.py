@@ -1,5 +1,6 @@
 # cash_forecast_inference.py
 
+
 import argparse
 import boto3
 import pandas as pd
@@ -11,13 +12,14 @@ import shutil
 from time import gmtime, strftime, sleep
 from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from sagemaker import Session
 import yaml
 
 from common import Config, load_and_validate_config, setup_logging, safe_s3_upload, load_scaling_parameters
+
+import logging  # Ensure logging is imported
 
 
 @dataclass
@@ -86,35 +88,59 @@ class CashForecastingInference:
         )
 
     def _load_scaling_parameters(self, country_code: str, model_timestamp: str) -> None:
-        """Load and validate scaling parameters from S3."""
-        scaling_params_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_params.json"
-        scaling_metadata_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_metadata.json"
+        """
+        Load and validate scaling parameters from S3.
 
-        self.logger.info(f"Downloading scaling parameters from s3://{self.config.bucket}/{scaling_params_key}")
-        self.scaling_params = load_scaling_parameters(
-            s3_client=self.s3_client,
-            logger=self.logger,
-            bucket=self.config.bucket,
-            scaling_params_key=scaling_params_key
-        )
+        Args:
+            country_code (str): The country code.
+            model_timestamp (str): The timestamp of the training model.
 
-        self.logger.info(f"Downloading scaling metadata from s3://{self.config.bucket}/{scaling_metadata_key}")
+        Raises:
+            FileNotFoundError: If scaling parameters are not found.
+            ValueError: If scaling parameters are invalid.
+        """
         try:
-            scaling_metadata_obj = self.s3_client.get_object(Bucket=self.config.bucket, Key=scaling_metadata_key)
-            self.scaling_metadata = json.loads(scaling_metadata_obj['Body'].read().decode('utf-8'))
+            # Construct S3 paths
+            scaling_params_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_params.json"
+            scaling_metadata_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_metadata.json"
+
+            # Download scaling parameters
+            self.logger.info(f"Downloading scaling parameters from s3://{self.config.bucket}/{scaling_params_key}")
+            self.scaling_params = load_scaling_parameters(
+                s3_client=self.s3_client,
+                logger=self.logger,
+                bucket=self.config.bucket,
+                scaling_params_key=scaling_params_key
+            )
+
+            # Download scaling metadata
+            self.logger.info(f"Downloading scaling metadata from s3://{self.config.bucket}/{scaling_metadata_key}")
+            try:
+                scaling_metadata_obj = self.s3_client.get_object(Bucket=self.config.bucket, Key=scaling_metadata_key)
+                self.scaling_metadata = json.loads(scaling_metadata_obj['Body'].read().decode('utf-8'))
+            except Exception as e:
+                self.logger.error(f"Failed to load scaling metadata from S3: {e}")
+                raise
+
+            # Validate scaling parameters
+            validate_scaling_parameters(self.scaling_params)
+
+            # Validate metadata structure
+            required_metadata = {'scaling_method', 'scaling_level', 'scaled_column', 'scaling_stats'}
+            if not all(key in self.scaling_metadata for key in required_metadata):
+                raise ValueError("Invalid scaling metadata structure")
+
+            self.logger.info(f"Successfully loaded and validated scaling parameters for {country_code}")
+
+        except self.s3_client.exceptions.NoSuchKey:
+            self.logger.error(f"Scaling parameters file not found in S3 for {country_code}")
+            raise FileNotFoundError(f"Scaling parameters file not found in S3 for {country_code}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON format in scaling files: {e}")
+            raise ValueError(f"Invalid JSON format in scaling files: {e}")
         except Exception as e:
-            self.logger.error(f"Failed to load scaling metadata from S3: {e}")
+            self.logger.error(f"Failed to load scaling parameters: {e}")
             raise
-
-        # Validate scaling parameters
-        validate_scaling_parameters(self.scaling_params)
-
-        # Validate metadata structure
-        required_metadata = {'scaling_method', 'scaling_level', 'scaled_column', 'scaling_stats'}
-        if not all(key in self.scaling_metadata for key in required_metadata):
-            raise ValueError("Invalid scaling metadata structure")
-
-        self.logger.info(f"Successfully loaded and validated scaling parameters for {country_code}")
 
     def prepare_inference_data(self, inference_template_file: str, country_code: str, effective_date: str) -> str:
         """Prepare the inference data based on the template."""
@@ -195,11 +221,15 @@ class CashForecastingInference:
             s3_inference_data_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
             self.logger.info(f"Inference data uploaded to {s3_inference_data_uri}")
 
-            # Run batch transform job
-            self._run_batch_transform_job(country_code, model_name, s3_inference_data_uri)
+            # Read inference data into DataFrame
+            inference_df = pd.read_csv(inference_file)
+            self.logger.info(f"Inference data loaded from {inference_file}")
 
-            # Get and process results
-            forecast_df = self._get_forecast_result(country_code)
+            # Run batch transform job with batch_number=1
+            self._run_batch_transform_job(country_code, model_name, s3_inference_data_uri, batch_number=1)
+
+            # Get and process results, passing inference_df for 'ForecastDate' assignment
+            forecast_df = self._get_forecast_result(country_code, inference_df)
 
             # Generate statistical report
             self._generate_statistical_report(forecast_df, country_code)
@@ -217,9 +247,80 @@ class CashForecastingInference:
                 self._rollback_scaling()
             raise
 
-    def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str) -> None:
+    def forecast(self, country_code: str, model_name: str, template_file: str,
+                backtesting: bool = False) -> pd.DataFrame:
+        """Generate forecasts starting from specified dates."""
+        # Load inference template
+        inference_template = pd.read_csv(template_file)
+
+        # Ensure correct data types
+        inference_template['ProductId'] = inference_template['ProductId'].astype(str)
+        inference_template['BranchId'] = inference_template['BranchId'].astype(str)
+        inference_template['Currency'] = inference_template['Currency'].astype(str)
+
+        # Load training data to get EffectiveDates
+        training_data = pd.read_csv(self.train_file)
+        training_data['EffectiveDate'] = pd.to_datetime(training_data['EffectiveDate']).dt.tz_localize(None)
+
+        if backtesting:
+            # Use past EffectiveDates for backtesting
+            effective_dates = sorted(training_data['EffectiveDate'].unique())
+        else:
+            # Use only the most recent date
+            effective_dates = [training_data['EffectiveDate'].max()]
+
+        # Define batch size
+        batch_size = self.config.batch_size
+
+        # Prepare inference data in batches
+        batch_number = 0
+        for i in range(0, len(effective_dates), batch_size):
+            batch_number += 1
+            batch_dates = effective_dates[i:i + batch_size]
+
+            for effective_date in batch_dates:
+                # Generate future dates for the forecast horizon
+                future_dates = [effective_date + pd.Timedelta(days=j) for j in
+                                range(1, self.config.forecast_horizon + 1)]
+
+                # Number of combinations
+                num_combinations = len(inference_template)
+
+                # Create inference data for each combination and future dates
+                temp_df = pd.DataFrame({
+                    'ProductId': np.tile(inference_template['ProductId'].values, self.config.forecast_horizon),
+                    'BranchId': np.tile(inference_template['BranchId'].values, self.config.forecast_horizon),
+                    'Currency': np.tile(inference_template['Currency'].values, self.config.forecast_horizon),
+                    'EffectiveDate': effective_date,
+                    'ForecastDate': np.repeat(future_dates, num_combinations),
+                    'Demand': np.nan  # Demand is unknown for future dates
+                })
+
+                # Save to CSV using self.output_dir
+                inference_file = os.path.join(self.output_dir, f"{country_code}_inference_batch_{batch_number}.csv")
+                temp_df.to_csv(inference_file, index=False)
+
+                # Upload to S3
+                s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference/{os.path.basename(inference_file)}"
+                self._safe_s3_upload(inference_file, s3_inference_key, overwrite=True)
+                s3_inference_data_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
+
+                # Run batch transform
+                self._run_batch_transform_job(country_code, model_name, s3_inference_data_uri, batch_number)
+
+        # After processing all batches, retrieve and combine forecast results
+        forecast_df = self._get_forecast_result(country_code)
+
+        # Save forecasts
+        self._save_forecasts(country_code, forecast_df)
+
+        return forecast_df
+
+
+    def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
+                                 batch_number: int) -> None:
         """Run a batch transform job for the given inference data."""
-        transform_job_name = f"{model_name}-transform-{self.timestamp}"
+        transform_job_name = f"{model_name}-transform-{self.timestamp}-{batch_number}"
 
         output_s3_uri = f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
 
@@ -248,7 +349,7 @@ class CashForecastingInference:
                     'InstanceCount': self.config.instance_count
                 }
             )
-            self.logger.info(f"Transform job {transform_job_name} created successfully.")
+            self.logger.info(f"Created transform job {transform_job_name}")
             self._monitor_transform_job(transform_job_name)
         except Exception as e:
             self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
@@ -282,7 +383,7 @@ class CashForecastingInference:
                 sleep(60)  # Wait before retrying
         raise TimeoutError(f"Transform job {transform_job_name} did not complete within {max_wait_time} seconds.")
 
-    def _get_forecast_result(self, country_code: str) -> pd.DataFrame:
+    def _get_forecast_result(self, country_code: str, inference_df: pd.DataFrame) -> pd.DataFrame:
         """Download and process forecast results."""
         output_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
         try:
@@ -326,6 +427,25 @@ class CashForecastingInference:
             forecast_df = pd.concat(forecast_data, ignore_index=True)
             self.logger.info(f"Combined forecast data shape: {forecast_df.shape}")
 
+            # Validate data lengths and combine with inference data
+            if len(forecast_df) != len(inference_df):
+                self.logger.error(f"Mismatch between inference data and forecast results. "
+                                  f"Inference records: {len(inference_df)}, Forecast records: {len(forecast_df)}")
+                raise ValueError("Mismatch between inference data and forecast results.")
+
+            # Reset indices and combine DataFrames
+            forecast_df.reset_index(drop=True, inplace=True)
+            inference_df.reset_index(drop=True, inplace=True)
+
+            # Combine with inference data while preserving necessary columns
+            forecast_df = pd.concat([
+                inference_df[['ProductId', 'BranchId', 'Currency']],
+                forecast_df
+            ], axis=1)
+
+            forecast_df['ForecastDate'] = inference_df['ForecastDate'].values
+            self.logger.info("Assigned 'ForecastDate' to forecast results based on inference data.")
+
             # Inverse scaling
             self.logger.info("Restoring original scale to forecasts...")
             for (currency, branch), params in self.scaling_params.items():
@@ -337,14 +457,15 @@ class CashForecastingInference:
                 for quantile in self.config.quantiles:
                     if quantile in forecast_df.columns:
                         forecast_df.loc[mask, quantile] = (
-                            (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
-                            params['mean']
+                                (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
+                                params['mean']
                         )
                         self.logger.info(
                             f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}"
                         )
                     else:
-                        self.logger.warning(f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
+                        self.logger.warning(
+                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
 
             self.logger.info("Inverse scaling completed successfully.")
             return forecast_df
@@ -495,8 +616,6 @@ class CashForecastingInference:
                 self.logger.info(f"Scaling rollback successful. Data saved to {rollback_file}")
             except Exception as e:
                 self.logger.error(f"Failed to rollback scaling: {e}")
-
-    # Additional methods such as _get_forecast_result can be similarly refactored to use shared utilities.
 
 
 def setup_logging_custom(timestamp: str) -> logging.Logger:

@@ -1,4 +1,5 @@
 # cash_forecast_model.py
+# python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
 
 import argparse
 import boto3
@@ -12,6 +13,7 @@ from time import gmtime, strftime, sleep
 from typing import Dict, Tuple, List
 from dataclasses import dataclass, field
 
+import logging  # <-- Added import for logging
 from sagemaker import Session
 import yaml
 import glob
@@ -285,6 +287,18 @@ class CashForecastingPipeline:
             self._safe_s3_upload(train_file, s3_train_key)
             train_data_s3_uri = f"s3://{self.config.bucket}/{os.path.dirname(s3_train_key)}/"
 
+            # Upload scaling parameters to S3
+            s3_scaling_params_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/scaling/{country_code}_scaling_params.json"
+            scaling_params_file = os.path.join(self.output_dir, f"{country_code}_scaling_params.json")
+            self._safe_s3_upload(scaling_params_file, s3_scaling_params_key, overwrite=True)
+            self.logger.info(f"Uploaded scaling parameters to s3://{self.config.bucket}/{s3_scaling_params_key}")
+
+            # Upload scaling metadata to S3
+            s3_scaling_metadata_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/scaling/{country_code}_scaling_metadata.json"
+            scaling_metadata_file = os.path.join(self.output_dir, f"{country_code}_scaling_metadata.json")
+            self._safe_s3_upload(scaling_metadata_file, s3_scaling_metadata_key, overwrite=True)
+            self.logger.info(f"Uploaded scaling metadata to s3://{self.config.bucket}/{s3_scaling_metadata_key}")
+
             # Train model
             job_name = self.train_model(
                 country_code,
@@ -299,17 +313,12 @@ class CashForecastingPipeline:
             # Get best model
             model_name = self._get_best_model(job_name, country_code)
 
-            # Forecasting
-            self.forecast(country_code, model_name, template_file, backtesting=backtesting)
+            # (Optional) Forecasting step can be removed if not needed in the training script
 
         except Exception as e:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
             raise
 
-    # The rest of the methods (forecast, _run_batch_transform_job, _monitor_transform_job,
-    # _get_forecast_result, _save_forecasts) remain unchanged from your original script.
-    # Due to space constraints, they are not shown here but should follow similar refactoring
-    # principles by utilizing shared utilities where applicable.
 
 def main():
     parser = argparse.ArgumentParser(description='Cash Forecasting Pipeline')
