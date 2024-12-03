@@ -1,6 +1,5 @@
 # cash_forecast_inference.py
-
-
+# python cs_scripts/cash_forecast_inference.py   --model_timestamp 20241201-153323   --effective_date 2024-07-15   --config cs_scripts/config.yaml   --countries ZM   --model_name ZM-model-20241201-153323   --inference_template ./cs_data/cash/ZM_custom_inference/ZM_inference_custom.csv
 import argparse
 import boto3
 import pandas as pd
@@ -316,7 +315,6 @@ class CashForecastingInference:
 
         return forecast_df
 
-
     def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
                                  batch_number: int) -> None:
         """Run a batch transform job for the given inference data."""
@@ -337,12 +335,13 @@ class CashForecastingInference:
                             'S3Uri': s3_inference_data_uri
                         }
                     },
-                    'ContentType': 'text/csv',
+                    'ContentType': 'text/csv',  # Ensure this matches your input format
                     'SplitType': 'Line'
                 },
                 TransformOutput={
                     'S3OutputPath': output_s3_uri,
-                    'AssembleWith': 'Line'
+                    'AssembleWith': 'Line',
+                    'Accept': 'text/csv'  # Set to 'text/csv' if model outputs CSV
                 },
                 TransformResources={
                     'InstanceType': self.config.instance_type,
@@ -410,8 +409,8 @@ class CashForecastingInference:
                         self.s3_client.download_file(self.config.bucket, s3_key, local_file)
                         self.logger.info(f"Downloaded forecast file {s3_key} to {local_file}")
 
-                        # Read forecast data
-                        df = pd.read_csv(local_file)
+                        # Read forecast data as CSV
+                        df = pd.read_csv(local_file, header=None)
                         forecast_data.append(df)
                     except Exception as e:
                         self.logger.error(f"Failed to process {s3_key}: {e}")
@@ -427,33 +426,24 @@ class CashForecastingInference:
             forecast_df = pd.concat(forecast_data, ignore_index=True)
             self.logger.info(f"Combined forecast data shape: {forecast_df.shape}")
 
-            # Validate data lengths
+            # Assign 'ForecastDate' and other columns from inference_df
             if len(forecast_df) != len(inference_df):
                 self.logger.error(f"Mismatch between inference data and forecast results. "
                                   f"Inference records: {len(inference_df)}, Forecast records: {len(forecast_df)}")
                 raise ValueError("Mismatch between inference data and forecast results.")
 
-            # Reset indices to align DataFrames correctly
-            forecast_df.reset_index(drop=True, inplace=True)
-            inference_df.reset_index(drop=True, inplace=True)
+            # The model output might not have headers, so assign columns accordingly
+            forecast_df.columns = self.config.quantiles  # Assuming the model outputs only quantiles
+            forecast_df['ForecastDate'] = inference_df['ForecastDate'].values
+            forecast_df['ProductId'] = inference_df['ProductId'].values
+            forecast_df['BranchId'] = inference_df['BranchId'].values
+            forecast_df['Currency'] = inference_df['Currency'].values
+            forecast_df['EffectiveDate'] = inference_df['EffectiveDate'].values
 
-            # Identify forecast columns (assuming they are not in inference_df)
-            forecast_columns = [col for col in forecast_df.columns if col not in inference_df.columns]
-
-            # Assign forecast columns to inference_df
-            for col in forecast_columns:
-                inference_df[col] = forecast_df[col]
-
-            # Now inference_df contains all the necessary data
-            forecast_df = inference_df
-
-            # Log the columns to verify merge result
-            self.logger.info(f"Forecast df columns after merging: {forecast_df.columns.tolist()}")
-
-            # Ensure correct data types
-            forecast_df['ProductId'] = forecast_df['ProductId'].astype(str)
-            forecast_df['BranchId'] = forecast_df['BranchId'].astype(str)
-            forecast_df['Currency'] = forecast_df['Currency'].astype(str)
+            # Ensure quantile columns are numeric
+            self.logger.info("Ensuring quantile columns are numeric...")
+            quantile_columns = self.config.quantiles
+            forecast_df[quantile_columns] = forecast_df[quantile_columns].apply(pd.to_numeric, errors='coerce')
 
             # Inverse scaling
             self.logger.info("Restoring original scale to forecasts...")
@@ -480,7 +470,7 @@ class CashForecastingInference:
             return forecast_df
 
         except Exception as e:
-            self.logger.error(f"Error in _get_forecast_result: {e}", exc_info=True)
+            self.logger.error(f"Error in _get_forecast_result: {e}")
             raise
         finally:
             # Cleanup
