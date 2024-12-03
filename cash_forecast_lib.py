@@ -7,7 +7,7 @@ import boto3
 import pandas as pd
 from typing import Dict, Tuple, List, Any
 from dataclasses import dataclass
-from time import strftime, gmtime
+from time import strftime, gmtime, sleep
 import numpy as np
 import shutil
 
@@ -256,169 +256,78 @@ def validate_scaling_parameters(scaling_params: Dict[Tuple[str, str], ScalingPar
             raise ValueError(f"Invalid number of observations for group {group}")
 
 
-def submit_batch_transform_job(
+def monitor_auto_ml_job(
         sm_client,
-        model_name: str,
-        transform_job_name: str,
-        input_s3_uri: str,
-        output_s3_uri: str,
-        instance_type: str,
-        instance_count: int,
-        content_type: str,
-        split_type: str,
-        accept_type: str,
-        logger: logging.Logger
-) -> None:
-    """Submit a SageMaker Batch Transform job."""
-    try:
-        sm_client.create_transform_job(
-            TransformJobName=transform_job_name,
-            ModelName=model_name,
-            BatchStrategy='MultiRecord',
-            TransformInput={
-                'DataSource': {
-                    'S3DataSource': {
-                        'S3DataType': 'S3Prefix',
-                        'S3Uri': input_s3_uri
-                    }
-                },
-                'ContentType': content_type,  # e.g., 'text/csv'
-                'SplitType': split_type  # e.g., 'Line'
-            },
-            TransformOutput={
-                'S3OutputPath': output_s3_uri,
-                'AssembleWith': 'Line',
-                'Accept': accept_type  # e.g., 'text/csv'
-            },
-            TransformResources={
-                'InstanceType': instance_type,
-                'InstanceCount': instance_count
-            }
-        )
-        logger.info(f"Submitted Batch Transform job: {transform_job_name}")
-    except Exception as e:
-        logger.error(f"Failed to submit Batch Transform job {transform_job_name}: {e}")
-        raise
-
-
-def monitor_batch_transform_job(
-        sm_client,
-        transform_job_name: str,
+        job_name: str,
         logger: logging.Logger,
         max_wait_time: int = 24 * 60 * 60  # 24 hours
-) -> None:
-    """Monitor the Batch Transform job until completion."""
-    logger.info(f"Monitoring Batch Transform job: {transform_job_name}")
+) -> str:
+    """Monitor the AutoML job until completion."""
+    logger.info(f"Monitoring AutoML job: {job_name}")
     sleep_time = 60  # Start with 1 minute
     elapsed_time = 0
     while elapsed_time < max_wait_time:
         try:
-            response = sm_client.describe_transform_job(TransformJobName=transform_job_name)
-            status = response['TransformJobStatus']
-            logger.info(f"Transform job {transform_job_name} status: {status}")
+            response = sm_client.describe_auto_ml_job_v2(AutoMLJobName=job_name)
+            status = response['AutoMLJobStatus']
+            logger.info(f"AutoML Job {job_name} Status: {status}")
             if status in ['Completed', 'Failed', 'Stopped']:
                 if status != 'Completed':
                     failure_reason = response.get('FailureReason', 'No failure reason provided.')
-                    logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
-                    raise RuntimeError(f"Transform job {transform_job_name} failed: {failure_reason}")
-                logger.info(f"Transform job {transform_job_name} completed successfully.")
-                return
+                    logger.error(f"AutoML Job {job_name} failed: {failure_reason}")
+                return status
             sleep(sleep_time)
             elapsed_time += sleep_time
-            sleep_time = min(int(sleep_time * 1.5), 600)  # Increase sleep time up to 10 minutes
+            sleep_time = min(int(sleep_time * 1.5), 600)  # Exponential backoff up to 10 minutes
         except Exception as e:
-            logger.error(f"Error monitoring Batch Transform job {transform_job_name}: {e}")
+            logger.error(f"Error monitoring AutoML job {job_name}: {e}")
             sleep_time = min(int(sleep_time * 1.5), 600)
             elapsed_time += sleep_time
             sleep(60)  # Wait before retrying
-    raise TimeoutError(f"Transform job {transform_job_name} did not complete within {max_wait_time} seconds.")
+    raise TimeoutError(f"AutoML job {job_name} did not complete within {max_wait_time} seconds.")
 
 
-def download_forecast_results(
-        s3_client,
-        bucket: str,
-        output_s3_prefix: str,
-        local_output_dir: str,
+def retrieve_best_model(
+        sm_client,
+        job_name: str,
+        country_code: str,
+        timestamp: str,
+        role_arn: str,
         logger: logging.Logger
-) -> pd.DataFrame:
-    """Download and combine forecast result files from S3."""
+) -> str:
+    """Retrieve the best model from the completed AutoML job."""
+    logger.info(f"Retrieving best model for AutoML job: {job_name}")
     try:
-        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=output_s3_prefix)
+        response = sm_client.describe_auto_ml_job_v2(AutoMLJobName=job_name)
+        best_candidate = response.get('BestCandidate')
+        if not best_candidate:
+            raise ValueError(f"No BestCandidate found for AutoML Job {job_name}")
     except Exception as e:
-        logger.error(f"Failed to list objects in S3: {e}")
+        logger.error(f"Error retrieving BestCandidate from AutoML job {job_name}: {e}")
         raise
 
-    if 'Contents' not in response:
-        raise FileNotFoundError(f"No forecast results found in S3 for {output_s3_prefix}")
+    model_name = f"{country_code}-model-{timestamp}"
 
-    # Create a temporary directory
-    temp_dir = os.path.join(local_output_dir, "temp_forecast")
-    os.makedirs(temp_dir, exist_ok=True)
-
+    # Check if the model already exists to prevent overwriting
     try:
-        # Download and process forecast files
-        forecast_data = []
-        for obj in response['Contents']:
-            s3_key = obj['Key']
-            if s3_key.endswith('.out'):  # Assuming forecast output files have .out extension
-                local_file = os.path.join(temp_dir, os.path.basename(s3_key))
-                try:
-                    download_file_from_s3(s3_client, bucket, s3_key, local_file, logger)
-                    # Read forecast data as CSV
-                    df = pd.read_csv(local_file, header=None)
-                    forecast_data.append(df)
-                except Exception as e:
-                    logger.error(f"Failed to process {s3_key}: {e}")
-                    continue
-                finally:
-                    if os.path.exists(local_file):
-                        os.remove(local_file)
-
-        if not forecast_data:
-            raise FileNotFoundError("No forecast output files found.")
-
-        # Combine forecast data
-        forecast_df = pd.concat(forecast_data, ignore_index=True)
-        logger.info(f"Combined forecast data shape: {forecast_df.shape}")
-
-        # Assign 'ForecastDate' and other columns from inference_df
-        # Note: You need to pass 'inference_df' or relevant mapping to this function
-        # For simplicity, assuming 'inference_df' is available globally or passed as a parameter
-        # Here, we'll skip assigning additional columns as it's context-dependent
-
-        return forecast_df
-
+        existing_models = sm_client.list_models(NameContains=model_name)
+        if existing_models.get('Models'):
+            raise ValueError(
+                f"A model with name {model_name} already exists. Choose a different timestamp or model name.")
     except Exception as e:
-        logger.error(f"Error in download_forecast_results: {e}")
+        logger.error(f"Error checking existing models: {e}")
         raise
-    finally:
-        # Cleanup
-        if os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Removed temporary directory {temp_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
 
-
-def save_forecasts_locally(
-        forecast_df: pd.DataFrame,
-        output_file: str,
-        quantiles: List[str],
-        logger: logging.Logger
-) -> None:
-    """Process and save forecast DataFrame to a CSV file locally."""
+    # Create the SageMaker model
     try:
-        # Assign quantile column names if not present
-        if not all(col in forecast_df.columns for col in quantiles):
-            raise ValueError("Forecast DataFrame does not contain all quantile columns.")
-
-        # Inverse scaling should be applied here if necessary
-        # This depends on your specific scaling logic
-
-        # Save to CSV
-        forecast_df.to_csv(output_file, index=False)
-        logger.info(f"Final forecast saved to {output_file}")
+        sm_client.create_model(
+            ModelName=model_name,
+            ExecutionRoleArn=role_arn,
+            Containers=best_candidate['InferenceContainers']
+        )
+        logger.info(f"Created SageMaker model: {model_name}")
     except Exception as e:
-        logger.error(f"Failed to save forecasts locally: {e}")
+        logger.error(f"Failed to create SageMaker model {model_name}: {e}")
         raise
+
+    return model_name

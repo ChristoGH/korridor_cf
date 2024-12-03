@@ -18,7 +18,9 @@ from cash_forecast_lib import (
     calculate_scaling_parameters,
     apply_scaling,
     create_output_directory,
-    save_scaling_params
+    save_scaling_params,
+    monitor_auto_ml_job,
+    retrieve_best_model
 )
 from common import Config, load_and_validate_config
 
@@ -41,6 +43,10 @@ def main():
 
     # Initialize S3 client
     s3_client = boto3.client('s3', region_name=config.region)
+
+    # Initialize SageMaker client
+    sm_client = boto3.client('sagemaker', region_name=config.region)
+    sm_session = Session()
 
     for country_code in args.countries:
         logger.info(f"Processing country: {country_code}")
@@ -97,10 +103,6 @@ def main():
             upload_file_to_s3(inference_template_file, s3_inference_template_key, s3_client, config.bucket, logger, overwrite=True)
             logger.info(f"Uploaded inference template to s3://{config.bucket}/{s3_inference_template_key}")
 
-            # Initialize SageMaker session and client
-            sm_client = boto3.client('sagemaker', region_name=config.region)
-            sm_session = Session()
-
             # Define AutoML job configuration
             job_name = f"{country_code}-ts-{timestamp}"
             automl_config = {
@@ -144,8 +146,25 @@ def main():
                 logger.error(f"Failed to start AutoML job: {e}")
                 raise
 
-            # TODO: Implement job monitoring and model retrieval as needed
-            # This can be further abstracted into the library if desired
+            # Monitor AutoML job
+            status = monitor_auto_ml_job(sm_client, job_name, logger)
+            if status != 'Completed':
+                raise RuntimeError(f"AutoML Job {job_name} ended with status: {status}")
+
+            # Retrieve the best model
+            model_name = retrieve_best_model(
+                sm_client=sm_client,
+                job_name=job_name,
+                country_code=country_code,
+                timestamp=timestamp,
+                role_arn=config.role_arn,
+                logger=logger
+            )
+
+            logger.info(f"Best model retrieved and created: {model_name}")
+
+            # (Optional) Deploy the model or save its details as needed
+            # For example, you could deploy the model to an endpoint here
 
         except Exception as e:
             logger.error(f"Failed to process {country_code}: {e}")
