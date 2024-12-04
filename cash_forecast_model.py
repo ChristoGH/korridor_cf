@@ -6,7 +6,7 @@ import argparse
 import os
 import json
 from time import gmtime, strftime
-
+import sys
 from sagemaker import Session
 import boto3
 
@@ -74,9 +74,6 @@ def main():
                 target_column = 'Demand'
                 scaling_params = calculate_scaling_parameters(data, group_columns, target_column, logger)
 
-                # Validate scaling parameters structure and content
-                # (Assuming validate_scaling_parameters is integrated within calculate_scaling_parameters)
-
                 # Apply scaling
                 scaled_data = apply_scaling(data, scaling_params, group_columns, target_column, logger)
 
@@ -84,6 +81,9 @@ def main():
                 base_output_path = "./cs_data/cash/"
                 output_dir = create_output_directory(base_output_path, country_code, timestamp)
                 logger.info(f"Output directory created at: {output_dir}")
+
+                # Define S3 prefix for uploads
+                s3_prefix = f"{config.prefix}-{country_code}/{timestamp}"
 
                 # Save scaling parameters
                 scaling_params_file = os.path.join(output_dir, f"{country_code}_scaling_params.json")
@@ -112,6 +112,12 @@ def main():
                 scaling_metadata_file = os.path.join(output_dir, f"{country_code}_scaling_metadata.json")
                 save_scaling_metadata(scaling_metadata, scaling_metadata_file, logger)
 
+                # Upload scaling metadata to S3
+                s3_scaling_metadata_key = f"{s3_prefix}/scaling/{country_code}_scaling_metadata.json"
+                upload_file_to_s3(scaling_metadata_file, s3_scaling_metadata_key, s3_client, config.bucket, logger,
+                                  overwrite=True)
+                logger.info(f"Uploaded scaling metadata to s3://{config.bucket}/{s3_scaling_metadata_key}")
+
                 # Save scaled training data
                 train_file = os.path.join(output_dir, f"{country_code}_train.csv")
                 scaled_data.to_csv(train_file, index=False)
@@ -123,9 +129,6 @@ def main():
                 inference_template.to_csv(inference_template_file, index=False)
                 logger.info(f"Inference template saved to {inference_template_file}")
 
-                # Define S3 prefix for uploads
-                s3_prefix = f"{config.prefix}-{country_code}/{timestamp}"
-
                 # Upload training data to S3
                 s3_train_key = f"{s3_prefix}/train/{os.path.basename(train_file)}"
                 upload_file_to_s3(train_file, s3_train_key, s3_client, config.bucket, logger)
@@ -135,11 +138,6 @@ def main():
                 s3_scaling_params_key = f"{s3_prefix}/scaling/{country_code}_scaling_params.json"
                 upload_file_to_s3(scaling_params_file, s3_scaling_params_key, s3_client, config.bucket, logger, overwrite=True)
                 logger.info(f"Uploaded scaling parameters to s3://{config.bucket}/{s3_scaling_params_key}")
-
-                # Upload scaling metadata to S3
-                s3_scaling_metadata_key = f"{s3_prefix}/scaling/{country_code}_scaling_metadata.json"
-                upload_file_to_s3(scaling_metadata_file, s3_scaling_metadata_key, s3_client, config.bucket, logger, overwrite=True)
-                logger.info(f"Uploaded scaling metadata to s3://{config.bucket}/{s3_scaling_metadata_key}")
 
                 # Upload inference template to S3
                 s3_inference_template_key = f"{s3_prefix}/inference/{os.path.basename(inference_template_file)}"
@@ -151,7 +149,7 @@ def main():
                 automl_config = {
                     'AutoMLJobName': job_name,
                     'AutoMLJobInputDataConfig': [{
-                        'ChannelType': 'training',
+                        'ChannelType': 'Training',
                         'ContentType': 'text/csv;header=present',
                         'CompressionType': 'None',
                         'DataSource': {
@@ -164,29 +162,32 @@ def main():
                     'OutputDataConfig': {
                         'S3OutputPath': f"s3://{config.bucket}/{s3_prefix}/output"
                     },
-                    'AutoMLProblemTypeConfig': {
-                        'TimeSeriesForecastingJobConfig': {
-                            'ForecastFrequency': config.forecast_frequency,
-                            'ForecastHorizon': config.forecast_horizon,
-                            'ForecastQuantiles': config.quantiles,
-                            'TimeSeriesConfig': {
-                                'TargetAttributeName': 'Demand',
-                                'TimestampAttributeName': 'EffectiveDate',
-                                'ItemIdentifierAttributeName': 'ProductId',
-                                'GroupingAttributeNames': ['BranchId', 'Currency']
-                            }
-                        }
+                    'AutoMLJobObjective': {
+                        'MetricName': 'RMSE'
                     },
-                    'RoleArn': config.role_arn
+                    'ProblemType': 'TimeSeriesForecasting',
+                    'RoleArn': config.role_arn,
+                    'TimeSeriesConfig': {
+                        'TargetAttributeName': 'Demand',
+                        'TimestampAttributeName': 'EffectiveDate',
+                        'ItemIdentifierAttributeName': 'ProductId',
+                        'GroupingAttributeNames': ['BranchId', 'Currency']
+                    },
+                    'AutoMLJobConfig': {
+                        'CompletionCriteria': {
+                            'MaxCandidates': 20,
+                            'MaxRuntimePerTrainingJobInSeconds': 3600
+                        }
+                    }
                 }
 
                 # Start AutoML job
                 logger.info(f"Starting AutoML job: {job_name}")
                 try:
-                    sm_client.create_auto_ml_job_v2(**automl_config)
+                    sm_client.create_auto_ml_job(**automl_config)
                     logger.info(f"AutoML job {job_name} initiated successfully.")
                 except Exception as e:
-                    logger.error(f"Failed to start AutoML job: {e}")
+                    logger.error(f"Failed to start AutoML job: {e}", exc_info=True)
                     raise
 
                 # Monitor AutoML job
@@ -210,10 +211,18 @@ def main():
                 # For example, you could deploy the model to an endpoint here
 
             except Exception as e:
-                logger.error(f"Failed to process {country_code}: {e}")
-                logger.debug("Exception details:", exc_info=True)
+                logger.error(f"Failed to process {country_code}: {e}", exc_info=True)
 
         logger.info("Cash Forecasting Model Pipeline completed successfully.")
 
-    if __name__ == "__main__":
-        main()
+    except Exception as e:
+        # Handle exceptions that occur outside the per-country processing
+        if 'logger' not in locals():
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger('CashForecast')
+        logger.error(f"Critical error in main process: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
