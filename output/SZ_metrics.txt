@@ -1,0 +1,2 @@
+MAPE: inf%
+RMSE: 267.12
