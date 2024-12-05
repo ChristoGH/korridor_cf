@@ -708,9 +708,12 @@ def load_config(config_path: str) -> Config:
         raise Exception(f"Failed to load configuration: {str(e)}")
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(inference: bool = False) -> argparse.Namespace:
     """
     Parse command line arguments.
+
+    Args:
+        inference (bool): Flag indicating if inference arguments should be included.
 
     Returns:
         Parsed argument namespace
@@ -725,4 +728,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--input_file', type=str, default=None,
                         help='Path to the input CSV file (overrides default)')
 
+    if inference:
+        parser.add_argument('--model_timestamp', type=str, required=True,
+                            help='Timestamp of the training run (YYYYMMDD-HHMMSS)')
+        parser.add_argument('--effective_date', type=str, required=True,
+                            help='Effective date for forecasts (YYYY-MM-DD)')
+        parser.add_argument('--model_name', type=str, required=True,
+                            help='Name of the SageMaker model to use for inference')
+        parser.add_argument('--inference_template', type=str, required=True,
+                            help='Path to the inference template CSV file')
+
     return parser.parse_args()
+

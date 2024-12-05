@@ -481,7 +481,8 @@ class CashForecastingPipeline:
 def main():
     """Main entry point for the cash forecasting inference script."""
     # Parse command line arguments using common.py's parse_arguments()
-    args = parse_arguments()
+    # Parse command line arguments using common.py's parse_arguments() with inference=True
+    args = parse_arguments(inference=True)
 
     # Setup logging using common.py's setup_logging
     timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
