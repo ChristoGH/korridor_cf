@@ -97,10 +97,10 @@ def main():
                     "scaled_column": "Demand",
                     "scaling_stats": {
                         f"{currency}-{branch}": {
-                            "mean": params.mean,
-                            "std": params.std,
-                            "min": params.min,
-                            "max": params.max
+                            "mean": params["mean"],
+                            "std": params["std"],
+                            "min": params["min"],
+                            "max": params["max"]
                         }
                         for (currency, branch), params in scaling_params.items()
                     },
@@ -114,14 +114,8 @@ def main():
 
                 # Upload scaling metadata to S3
                 s3_scaling_metadata_key = f"{s3_prefix}/scaling/{country_code}_scaling_metadata.json"
-                upload_file_to_s3(
-                    scaling_metadata_file,
-                    s3_scaling_metadata_key,
-                    s3_client,
-                    config.bucket,
-                    logger,
-                    overwrite=True
-                )
+                upload_file_to_s3(scaling_metadata_file, s3_scaling_metadata_key, s3_client, config.bucket, logger,
+                                  overwrite=True)
                 logger.info(f"Uploaded scaling metadata to s3://{config.bucket}/{s3_scaling_metadata_key}")
 
                 # Save scaled training data
@@ -130,52 +124,31 @@ def main():
                 logger.info(f"Scaled training data saved to {train_file}")
 
                 # Create inference template with unique combinations
-                inference_template = data.drop_duplicates(subset=['ProductId', 'BranchId', 'Currency'])[
-                    ['ProductId', 'BranchId', 'Currency']]
+                inference_template = data.drop_duplicates(subset=['ProductId', 'BranchId', 'Currency'])[['ProductId', 'BranchId', 'Currency']]
                 inference_template_file = os.path.join(output_dir, f"{country_code}_inference_template.csv")
                 inference_template.to_csv(inference_template_file, index=False)
                 logger.info(f"Inference template saved to {inference_template_file}")
 
                 # Upload training data to S3
                 s3_train_key = f"{s3_prefix}/train/{os.path.basename(train_file)}"
-                upload_file_to_s3(
-                    train_file,
-                    s3_train_key,
-                    s3_client,
-                    config.bucket,
-                    logger
-                )
+                upload_file_to_s3(train_file, s3_train_key, s3_client, config.bucket, logger)
                 logger.info(f"Uploaded training data to s3://{config.bucket}/{s3_train_key}")
 
                 # Upload scaling parameters to S3
                 s3_scaling_params_key = f"{s3_prefix}/scaling/{country_code}_scaling_params.json"
-                upload_file_to_s3(
-                    scaling_params_file,
-                    s3_scaling_params_key,
-                    s3_client,
-                    config.bucket,
-                    logger,
-                    overwrite=True
-                )
+                upload_file_to_s3(scaling_params_file, s3_scaling_params_key, s3_client, config.bucket, logger, overwrite=True)
                 logger.info(f"Uploaded scaling parameters to s3://{config.bucket}/{s3_scaling_params_key}")
 
                 # Upload inference template to S3
                 s3_inference_template_key = f"{s3_prefix}/inference/{os.path.basename(inference_template_file)}"
-                upload_file_to_s3(
-                    inference_template_file,
-                    s3_inference_template_key,
-                    s3_client,
-                    config.bucket,
-                    logger,
-                    overwrite=True
-                )
+                upload_file_to_s3(inference_template_file, s3_inference_template_key, s3_client, config.bucket, logger, overwrite=True)
                 logger.info(f"Uploaded inference template to s3://{config.bucket}/{s3_inference_template_key}")
 
                 # Define AutoML job configuration
                 job_name = f"{country_code}-ts-{timestamp}"
                 automl_config = {
                     'AutoMLJobName': job_name,
-                    'InputDataConfig': [{
+                    'AutoMLJobInputDataConfig': [{
                         'ChannelType': 'Training',
                         'ContentType': 'text/csv;header=present',
                         'CompressionType': 'None',
@@ -190,10 +163,16 @@ def main():
                         'S3OutputPath': f"s3://{config.bucket}/{s3_prefix}/output"
                     },
                     'AutoMLJobObjective': {
-                        'MetricName': 'RMSE'  # Objective metric
+                        'MetricName': 'RMSE'
                     },
-                    'ProblemType': 'TimeSeriesForecasting',  # Specify problem type
+                    'ProblemType': 'TimeSeriesForecasting',
                     'RoleArn': config.role_arn,
+                    'TimeSeriesConfig': {
+                        'TargetAttributeName': 'Demand',
+                        'TimestampAttributeName': 'EffectiveDate',
+                        'ItemIdentifierAttributeName': 'ProductId',
+                        'GroupingAttributeNames': ['BranchId', 'Currency']
+                    },
                     'AutoMLJobConfig': {
                         'CompletionCriteria': {
                             'MaxCandidates': 20,
@@ -232,8 +211,7 @@ def main():
                 # For example, you could deploy the model to an endpoint here
 
             except Exception as e:
-                logger.error(f"Error processing country {country_code}: {e}", exc_info=True)
-                continue  # Skip to the next country
+                logger.error(f"Failed to process {country_code}: {e}", exc_info=True)
 
         logger.info("Cash Forecasting Model Pipeline completed successfully.")
 

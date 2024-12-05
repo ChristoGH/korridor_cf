@@ -1,2 +1,0 @@
-MAPE: inf%
-RMSE: 199.24
