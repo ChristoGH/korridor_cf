@@ -1,212 +1,100 @@
-# python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
+# cash_forecast_model.py
+
+"""
+Cash Forecasting Model Building Script
+
+This script builds and trains forecasting models for cash demand using the provided configuration.
+It leverages shared utilities from common.py for configuration management, data processing,
+logging, and AWS interactions.
+"""
 
 import argparse
+import sys
+from pathlib import Path
+from time import gmtime, strftime
+
 import boto3
 import pandas as pd
 import numpy as np
-import os
-import logging
-import sys
-from time import gmtime, strftime, sleep
 from sagemaker import Session
-from typing import Dict, Tuple, Optional, List
-from dataclasses import dataclass
-import yaml
-import glob
-from pydantic import BaseModel, ValidationError
-import shutil
-from dataclasses import dataclass, field
-import json
 
-
-class ConfigModel(BaseModel):
-    """Pydantic model for configuration validation"""
-    region: str
-    bucket: str
-    prefix: str
-    role_arn: str
-    instance_type: str = "ml.m5.large"
-    instance_count: int = 1
-    forecast_horizon: int = 10
-    forecast_frequency: str = "1D"
-    batch_size: int = 100
-    quantiles: List[str] = ['p10', 'p50', 'p90']
-
-
-@dataclass
-class Config:
-    """Configuration parameters for the forecasting pipeline."""
-    region: str
-    bucket: str
-    prefix: str
-    role_arn: str
-    instance_type: str = "ml.m5.large"
-    instance_count: int = 1
-    forecast_horizon: int = 10
-    forecast_frequency: str = "1D"
-    batch_size: int = 100
-    quantiles: List[str] = field(default_factory=lambda: ['p10', 'p50', 'p90'])
+from common import (
+    ConfigModel,
+    Config,
+    S3Handler,
+    DataProcessor,
+    setup_logging,
+    load_config,
+    parse_arguments
+)
 
 
 class CashForecastingPipeline:
-    def __init__(self, config: Config):
+    """Pipeline for training and forecasting cash demand models."""
+
+    def __init__(self, config: Config, logger: logging.Logger):
         """Initialize the forecasting pipeline with configuration."""
         self.config = config
+        self.logger = logger
         self.session = Session()
-        self.sm_client = boto3.client('sagemaker', region_name=config.region)
-        self.s3_client = boto3.client('s3')
+        self.sm_client = boto3.client('sagemaker', region_name=self.config.region)
+        self.s3_handler = S3Handler(region=self.config.region, logger=self.logger)
+        self.data_processor = DataProcessor(logger=self.logger)
         self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
-        self.role = config.role_arn
-        self._setup_logging()
+        self.role = self.config.role_arn
         self.train_file = None
         self.output_dir = None  # Will be set in prepare_data
 
-    def _setup_logging(self):
-        """Configure logging for the pipeline."""
-        self.logger = logging.getLogger('CashForecast')
-        self.logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        # File handler
-        fh = logging.FileHandler(f'cash_forecast_{self.timestamp}.log')
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(formatter)
-        # Stream handler
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(formatter)
-        # Add handlers to logger
-        self.logger.addHandler(fh)
-        self.logger.addHandler(ch)
-
-    def _safe_s3_upload(self,
-                        local_path: str,
-                        s3_key: str,
-                        overwrite: bool = False) -> None:
-        """Safely upload file to S3 with existence check."""
-        try:
-            if not overwrite:
-                existing = self.s3_client.list_objects_v2(
-                    Bucket=self.config.bucket,
-                    Prefix=s3_key
-                )
-                if 'Contents' in existing:
-                    raise FileExistsError(f"S3 object already exists: {s3_key}")
-
-            self.s3_client.upload_file(
-                Filename=local_path,
-                Bucket=self.config.bucket,
-                Key=s3_key
-            )
-            self.logger.info(f"Uploaded {local_path} to s3://{self.config.bucket}/{s3_key}")
-        except Exception as e:
-            self.logger.error(f"Failed to upload {local_path} to S3: {e}")
-            raise
-
     def prepare_data(self, input_file: str, country_code: str) -> Tuple[str, str]:
         """Prepare data for training and create inference template."""
-        # Load and preprocess data
-        data = pd.read_csv(input_file)
-        required_columns = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'Demand']
-        for col in required_columns:
-            if col not in data.columns:
-                raise ValueError(f"Input data is missing required column: {col}")
+        self.logger.info(f"Preparing data for country: {country_code}")
 
-        # Use only the required columns
-        data = data[required_columns]
+        # Load data using DataProcessor
+        data = self.data_processor.load_data(input_file)
 
-        # Ensure correct data types
-        data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate']).dt.tz_localize(None)
-        data['ProductId'] = data['ProductId'].astype(str)
-        data['BranchId'] = data['BranchId'].astype(str)
-        data['Currency'] = data['Currency'].astype(str)
-        data.sort_values('EffectiveDate', inplace=True)
-
-        # Calculate scaling parameters per Currency-BranchId combination
-        scaling_params = {}
-        for (currency, branch), group in data.groupby(['Currency', 'BranchId']):
-            scaling_params[(currency, branch)] = {
-                'mean': group['Demand'].mean(),
-                'std': group['Demand'].std(),
-                'min': group['Demand'].min(),
-                'max': group['Demand'].max(),
-                'last_value': group.iloc[-1]['Demand'],
-                'n_observations': len(group)
-            }
-
-        # Apply scaling to Demand values
-        scaled_data = data.copy()
-        for (currency, branch), params in scaling_params.items():
-            mask = (data['Currency'] == currency) & (data['BranchId'] == branch)
-            # Standardize the data
-            scaled_data.loc[mask, 'Demand'] = (
-                    (data.loc[mask, 'Demand'] - params['mean']) /
-                    (params['std'] if params['std'] != 0 else 1)
-            )
+        # Prepare and scale data
+        scaled_data, scaling_params = self.data_processor.prepare_data(data)
 
         # Create directories for output
-        self.output_dir = f"./cs_data/cash/{country_code}_{self.timestamp}"
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.output_dir = Path(f"./cs_data/cash/{country_code}_{self.timestamp}")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Save scaling parameters
-        scaling_file = os.path.join(self.output_dir, f"{country_code}_scaling_params.json")
-        with open(scaling_file, 'w') as f:
-            # Convert scaling_params keys to strings for JSON serialization
-            serializable_params = {
-                f"{currency}_{branch}": params
-                for (currency, branch), params in scaling_params.items()
-            }
-            json.dump(serializable_params, f, indent=2)
+        scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
+        self.data_processor.save_scaling_params(scaling_params, scaling_file)
 
-        # Save metadata about the scaling
-        metadata = {
-            'scaling_method': 'standardization',
-            'scaling_level': 'currency_branch',
-            'scaled_column': 'Demand',
-            'timestamp': self.timestamp,
-            'scaling_stats': {
-                'global_mean': data['Demand'].mean(),
-                'global_std': data['Demand'].std(),
-                'global_min': data['Demand'].min(),
-                'global_max': data['Demand'].max(),
-                'n_groups': len(scaling_params),
-                'n_total_observations': len(data)
-            }
-        }
+        # Generate and save scaling metadata
+        metadata = self.data_processor.generate_scaling_metadata(data, scaling_params)
+        metadata_file = self.output_dir / f"{country_code}_scaling_metadata.json"
+        self.data_processor.save_metadata(metadata, metadata_file)
 
-        metadata_file = os.path.join(self.output_dir, f"{country_code}_scaling_metadata.json")
-        with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
-
-        # Define file paths
-        train_file = os.path.join(self.output_dir, f"{country_code}_train.csv")
-        inference_template_file = os.path.join(self.output_dir, f"{country_code}_inference_template.csv")
-
-        # Save training data
+        # Save scaled training data
+        train_file = self.output_dir / f"{country_code}_train.csv"
         scaled_data.to_csv(train_file, index=False)
-        self.train_file = train_file  # Save train file path for later use
+        self.train_file = str(train_file)
+        self.logger.info(f"Saved scaled training data to {train_file}")
 
-        # Create inference template with unique combinations
+        # Create and save inference template
         inference_template = data.drop_duplicates(
             subset=['ProductId', 'BranchId', 'Currency']
         )[['ProductId', 'BranchId', 'Currency']]
-
-        # Save inference template
+        inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
         inference_template.to_csv(inference_template_file, index=False)
+        self.logger.info(f"Saved inference template to {inference_template_file}")
 
-        # Log scaling information
-        self.logger.info(f"Applied standardization scaling at currency-branch level")
-        self.logger.info(f"Scaling parameters saved to {scaling_file}")
-        self.logger.info(f"Scaling metadata saved to {metadata_file}")
-        self.logger.info(f"Global scale: mean={metadata['scaling_stats']['global_mean']:.2f}, "
-                         f"std={metadata['scaling_stats']['global_std']:.2f}")
+        return str(train_file), str(inference_template_file)
 
-        return train_file, inference_template_file
-
+    def upload_training_data(self, train_file: str, country_code: str) -> str:
+        """Upload training data to S3 and return the S3 URI."""
+        s3_train_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/train/{Path(train_file).name}"
+        self.s3_handler.safe_upload(local_path=train_file, bucket=self.config.bucket, s3_key=s3_train_key)
+        train_data_s3_uri = f"s3://{self.config.bucket}/{s3_train_key}"
+        self.logger.info(f"Training data uploaded to {train_data_s3_uri}")
+        return train_data_s3_uri
 
     def train_model(self, country_code: str, train_data_s3_uri: str) -> str:
-        """Train the forecasting model."""
+        """Train the forecasting model using SageMaker AutoML."""
         self.logger.info(f"Starting model training for {country_code}")
-
         job_name = f"{country_code}-ts-{self.timestamp}"
 
         # Configure AutoML job
@@ -245,35 +133,42 @@ class CashForecastingPipeline:
         # Start training
         try:
             self.sm_client.create_auto_ml_job_v2(**automl_config)
+            self.logger.info(f"AutoML job {job_name} created successfully.")
         except Exception as e:
             self.logger.error(f"Failed to start AutoML job: {e}")
             raise
+
         return job_name
 
     def _monitor_job(self, job_name: str) -> str:
         """Monitor the AutoML job until completion."""
-        self.logger.info(f"Monitoring job {job_name}")
+        self.logger.info(f"Monitoring AutoML job: {job_name}")
         sleep_time = 60  # Start with 1 minute
+
         while True:
             try:
                 response = self.sm_client.describe_auto_ml_job_v2(AutoMLJobName=job_name)
                 status = response['AutoMLJobStatus']
                 self.logger.info(f"Job {job_name} status: {status}")
+
                 if status in ['Completed', 'Failed', 'Stopped']:
                     if status != 'Completed':
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"AutoML job {job_name} failed: {failure_reason}")
                     break
+
                 sleep(sleep_time)
                 sleep_time = min(sleep_time * 1.5, 600)  # Increase sleep time up to 10 minutes
             except Exception as e:
                 self.logger.error(f"Error monitoring AutoML job: {e}")
                 sleep(60)  # Wait before retrying
+
         return status
 
     def _get_best_model(self, job_name: str, country_code: str) -> str:
-        """Retrieve the best model from the AutoML job."""
-        self.logger.info(f"Retrieving best model for job {job_name}")
+        """Retrieve and create the best model from the AutoML job."""
+        self.logger.info(f"Retrieving best model for job: {job_name}")
+
         while True:
             try:
                 response = self.sm_client.describe_auto_ml_job_v2(AutoMLJobName=job_name)
@@ -305,94 +200,93 @@ class CashForecastingPipeline:
                 ExecutionRoleArn=self.role,
                 Containers=best_candidate['InferenceContainers']
             )
-            self.logger.info(f"Created model {model_name}")
+            self.logger.info(f"Created model {model_name} successfully.")
         except Exception as e:
             self.logger.error(f"Failed to create model {model_name}: {e}")
             raise
+
         return model_name
 
     def forecast(self, country_code: str, model_name: str, template_file: str,
                  backtesting: bool = False) -> pd.DataFrame:
-        """Generate forecasts starting from specified dates."""
-        # Load inference template
-        inference_template = pd.read_csv(template_file)
+        """Generate forecasts using the trained model."""
+        self.logger.info(f"Starting forecasting for country: {country_code}")
 
-        # Ensure correct data types
-        inference_template['ProductId'] = inference_template['ProductId'].astype(str)
-        inference_template['BranchId'] = inference_template['BranchId'].astype(str)
-        inference_template['Currency'] = inference_template['Currency'].astype(str)
+        # Load inference template using DataProcessor
+        inference_template = self.data_processor.load_data(template_file)
 
-        # Load training data to get EffectiveDates
-        training_data = pd.read_csv(self.train_file)
-        training_data['EffectiveDate'] = pd.to_datetime(training_data['EffectiveDate']).dt.tz_localize(None)
+        # Retrieve effective dates using DataProcessor
+        effective_dates = self.data_processor.get_effective_dates(train_file=self.train_file, backtesting=backtesting)
 
-        if backtesting:
-            # Use past EffectiveDates for backtesting
-            effective_dates = sorted(training_data['EffectiveDate'].unique())
-        else:
-            # Use only the most recent date
-            effective_dates = [training_data['EffectiveDate'].max()]
-
-        # Define batch size
+        # Generate inference data in batches
         batch_size = self.config.batch_size
+        forecast_df = pd.DataFrame()
 
-        # Prepare inference data in batches
-        batch_number = 0
-        for i in range(0, len(effective_dates), batch_size):
-            batch_number += 1
-            batch_dates = effective_dates[i:i + batch_size]
-            inference_data_list = []
+        for batch_number, batch_dates in enumerate(
+                self.data_processor.chunk_list(effective_dates, batch_size), start=1):
+            self.logger.info(f"Processing batch {batch_number} with {len(batch_dates)} dates.")
 
-            for effective_date in batch_dates:
-                # Generate future dates for the forecast horizon
-                future_dates = [effective_date + pd.Timedelta(days=j) for j in
-                                range(1, self.config.forecast_horizon + 1)]
+            # Generate inference data
+            inference_data = self.data_processor.generate_inference_data(
+                inference_template=inference_template,
+                batch_dates=batch_dates,
+                forecast_horizon=self.config.forecast_horizon
+            )
 
-                # Number of combinations
-                num_combinations = len(inference_template)
-
-                # Create inference data for each combination and future dates
-                temp_df = pd.DataFrame({
-                    'ProductId': np.tile(inference_template['ProductId'].values, self.config.forecast_horizon),
-                    'BranchId': np.tile(inference_template['BranchId'].values, self.config.forecast_horizon),
-                    'Currency': np.tile(inference_template['Currency'].values, self.config.forecast_horizon),
-                    'EffectiveDate': effective_date,
-                    'ForecastDate': np.repeat(future_dates, num_combinations),
-                    'Demand': np.nan  # Demand is unknown for future dates
-                })
-                inference_data_list.append(temp_df)
-
-            # Combine batch inference data
-            inference_data = pd.concat(inference_data_list, ignore_index=True).drop(columns=['Demand'])
-
-            # Save to CSV using self.output_dir
-            inference_file = os.path.join(self.output_dir, f"{country_code}_inference_batch_{batch_number}.csv")
+            # Save inference data to CSV
+            inference_file = self.output_dir / f"{country_code}_inference_batch_{batch_number}.csv"
             inference_data.to_csv(inference_file, index=False)
+            self.logger.info(f"Saved inference batch to {inference_file}")
 
-            # Upload to S3
-            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference/{os.path.basename(inference_file)}"
-            self._safe_s3_upload(inference_file, s3_inference_key, overwrite=True)
+            # Upload inference data to S3 using S3Handler
+            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference/{inference_file.name}"
+            self.s3_handler.safe_upload(local_path=str(inference_file), bucket=self.config.bucket,
+                                        s3_key=s3_inference_key, overwrite=True)
             s3_inference_data_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
+            self.logger.info(f"Uploaded inference batch to {s3_inference_data_uri}")
 
             # Run batch transform
             self._run_batch_transform_job(country_code, model_name, s3_inference_data_uri, batch_number)
 
-        # After processing all batches, retrieve and combine forecast results
-        forecast_df = self._get_forecast_result(country_code)
+        # Retrieve and combine forecast results
+        forecast_df = self.data_processor.retrieve_forecast_results(
+            s3_client=self.s3_handler.client,
+            bucket=self.config.bucket,
+            prefix=f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/",
+            output_dir=self.output_dir
+        )
 
-        # Save forecasts
-        self._save_forecasts(country_code, forecast_df)
+        # Load scaling parameters
+        scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
+        scaling_params = self.data_processor.load_scaling_params(scaling_file=scaling_file)
 
-        return forecast_df
+        # Restore scaling
+        restored_forecast_df = self.data_processor.restore_scaling(
+            forecast_df=forecast_df,
+            scaling_params=scaling_params,
+            quantiles=self.config.quantiles,
+            logger=self.logger
+        )
+
+        # Save final forecasts
+        self.data_processor.save_final_forecasts(
+            forecasts_df=restored_forecast_df,
+            country_code=country_code,
+            timestamp=self.timestamp,
+            config=self.config,
+            logger=self.logger
+        )
+
+        self.logger.info(f"Forecasting completed for country: {country_code}")
+        return restored_forecast_df
 
     def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
                                  batch_number: int) -> None:
         """Run a batch transform job for the given inference data."""
         transform_job_name = f"{model_name}-transform-{self.timestamp}-{batch_number}"
-
         output_s3_uri = f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
 
-        # Start batch transform job
+        # Start batch transform job using SageMaker
         try:
             self.sm_client.create_transform_job(
                 TransformJobName=transform_job_name,
@@ -417,7 +311,7 @@ class CashForecastingPipeline:
                     'InstanceCount': self.config.instance_count
                 }
             )
-            self.logger.info(f"Created transform job {transform_job_name}")
+            self.logger.info(f"Created transform job {transform_job_name} successfully.")
             self._monitor_transform_job(transform_job_name)
         except Exception as e:
             self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
@@ -425,300 +319,73 @@ class CashForecastingPipeline:
 
     def _monitor_transform_job(self, transform_job_name: str) -> None:
         """Monitor the batch transform job until completion."""
-        self.logger.info(f"Monitoring transform job {transform_job_name}")
+        self.logger.info(f"Monitoring transform job: {transform_job_name}")
         sleep_time = 30  # Start with 30 seconds
+
         while True:
             try:
                 response = self.sm_client.describe_transform_job(TransformJobName=transform_job_name)
                 status = response['TransformJobStatus']
                 self.logger.info(f"Transform job {transform_job_name} status: {status}")
+
                 if status in ['Completed', 'Failed', 'Stopped']:
                     if status != 'Completed':
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
                         raise RuntimeError(
-                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}"
+                        )
                     break
+
                 sleep(sleep_time)
                 sleep_time = min(sleep_time * 1.5, 600)  # Increase sleep time up to 10 minutes
             except Exception as e:
-                self.logger.error(f"Error monitoring transform job: {e}")
+                self.logger.error(f"Error monitoring transform job {transform_job_name}: {e}")
                 sleep(60)  # Wait before retrying
-
-    def _get_forecast_result(self, country_code: str) -> pd.DataFrame:
-        """Download and process forecast results."""
-        # Load scaling parameters at start
-        scaling_file = os.path.join(self.output_dir, f"{country_code}_scaling_params.json")
-        try:
-            with open(scaling_file, 'r') as f:
-                serialized_params = json.load(f)
-                scaling_params = {
-                    tuple(k.split('_')): v
-                    for k, v in serialized_params.items()
-                }
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"Scaling parameters not found at {scaling_file}. Model requires scaling parameters from training.")
-
-        output_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
-        try:
-            response = self.s3_client.list_objects_v2(Bucket=self.config.bucket, Prefix=output_s3_prefix)
-        except Exception as e:
-            self.logger.error(f"Failed to list objects in S3: {e}")
-            raise
-
-        if 'Contents' not in response:
-            raise FileNotFoundError(f"No inference results found in S3 for {output_s3_prefix}")
-
-        # Create a temporary directory
-        temp_dir = f"./temp/{country_code}_{self.timestamp}/"
-        os.makedirs(temp_dir, exist_ok=True)
-
-        try:
-            # Download and process forecast files
-            forecast_data = []
-            for obj in response['Contents']:
-                s3_key = obj['Key']
-                if s3_key.endswith('.out'):
-                    local_file = os.path.join(temp_dir, os.path.basename(s3_key))
-                    try:
-                        self.s3_client.download_file(self.config.bucket, s3_key, local_file)
-
-                        # Read the first few lines to analyze the structure
-                        with open(local_file, 'r') as f:
-                            first_lines = [next(f) for _ in range(5)]
-
-                        # Determine number of columns from first line
-                        num_columns = len(first_lines[0].strip().split(','))
-                        self.logger.info(f"Found {num_columns} columns in forecast output")
-
-                        # Read with pandas, explicitly creating column names
-                        df = pd.read_csv(local_file, header=None,
-                                         names=[f'forecast_{i}' for i in range(num_columns)])
-
-                        # Detect the actual forecast columns based on numeric content
-                        numeric_cols = df.select_dtypes(include=[np.number]).columns
-                        self.logger.info(f"Found {len(numeric_cols)} numeric columns")
-
-                        if len(numeric_cols) >= len(self.config.quantiles):
-                            # Take the last n columns where n is the number of quantiles
-                            forecast_cols = numeric_cols[-len(self.config.quantiles):]
-                            df_subset = df[forecast_cols]
-                            df_subset.columns = self.config.quantiles
-                            forecast_data.append(df_subset)
-                        else:
-                            # Log detailed error and skip this file
-                            self.logger.error(
-                                f"Found {len(numeric_cols)} numeric columns, expected at least {len(self.config.quantiles)}")
-                            self.logger.error(f"File content preview: {first_lines[:2]}")
-                            continue
-
-                    except Exception as e:
-                        self.logger.error(f"Failed to process {s3_key}: {e}")
-                        self.logger.error(f"File content preview: {first_lines[:2]}")
-                        continue
-                    finally:
-                        if os.path.exists(local_file):
-                            os.remove(local_file)
-
-            if not forecast_data:
-                raise FileNotFoundError("No forecast output files found.")
-
-            # Combine forecast data
-            forecast_df = pd.concat(forecast_data, ignore_index=True)
-
-            # Load and combine inference data
-            inference_files = glob.glob(os.path.join(self.output_dir, f"{country_code}_inference_batch_*.csv"))
-            if not inference_files:
-                raise FileNotFoundError(f"No inference batch files found in {self.output_dir}")
-
-            inference_data_list = []
-            for file in inference_files:
-                try:
-                    df = pd.read_csv(file)
-                    inference_data_list.append(df)
-                except Exception as e:
-                    self.logger.error(f"Failed to read inference file {file}: {e}")
-                    continue
-
-            if not inference_data_list:
-                raise ValueError("No valid inference data found")
-
-            inference_data = pd.concat(inference_data_list, ignore_index=True)
-
-            # Convert dates
-            for date_col in ['EffectiveDate', 'ForecastDate']:
-                if date_col in inference_data.columns:
-                    inference_data[date_col] = pd.to_datetime(inference_data[date_col]).dt.tz_localize(None)
-
-            # Verify row counts match
-            if len(forecast_df) != len(inference_data):
-                self.logger.warning(
-                    f"Row count mismatch: forecast_df={len(forecast_df)}, inference_data={len(inference_data)}")
-                # Align the data
-                min_rows = min(len(forecast_df), len(inference_data))
-                forecast_df = forecast_df.iloc[:min_rows]
-                inference_data = inference_data.iloc[:min_rows]
-
-            # Combine inference data with forecasts
-            result_df = pd.concat([
-                inference_data[['ProductId', 'BranchId', 'Currency',
-                                'EffectiveDate', 'ForecastDate']].reset_index(drop=True),
-                forecast_df.reset_index(drop=True)
-            ], axis=1)
-
-            # After creating result_df but before returning
-            self.logger.info("Restoring original scale to forecasts...")
-
-            # Create a copy to preserve scaled values
-            result_df_scaled = result_df.copy()
-
-            # Restore scaling for each group
-            for (currency, branch), params in scaling_params.items():
-                mask = (result_df['Currency'] == currency) & (result_df['BranchId'] == branch)
-                if mask.sum() == 0:
-                    self.logger.warning(f"No forecasts found for Currency={currency}, Branch={branch}")
-                    continue
-
-                # Inverse transform the forecasts for each quantile
-                for quantile in self.config.quantiles:
-                    if quantile in result_df.columns:
-                        result_df.loc[mask, quantile] = (
-                                (result_df.loc[mask, quantile] *
-                                 (params['std'] if params['std'] != 0 else 1)) +
-                                params['mean']
-                        )
-                        self.logger.info(
-                            f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}"
-                        )
-                    else:
-                        self.logger.warning(
-                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
-
-                # Validate the scaling restoration
-                for quantile in self.config.quantiles:
-                    if quantile not in result_df.columns:
-                        continue
-                    scaled_stats = result_df_scaled.loc[mask, quantile].describe()
-                    restored_stats = result_df.loc[mask, quantile].describe()
-
-                    self.logger.info(
-                        f"Scaling restoration for {currency}-{branch} {quantile}:\n"
-                        f"  Scaled   -> mean: {scaled_stats['mean']:.2f}, std: {scaled_stats['std']:.2f}\n"
-                        f"  Restored -> mean: {restored_stats['mean']:.2f}, std: {restored_stats['std']:.2f}\n"
-                        f"  Expected -> mean: {params['mean']:.2f}, std: {params['std']:.2f}"
-                    )
-
-                    # Check for anomalies
-                    if restored_stats['min'] < 0:
-                        self.logger.warning(
-                            f"Negative values in restored forecasts for {currency}-{branch} {quantile}: "
-                            f"min={restored_stats['min']:.2f}"
-                        )
-
-                    # Check for extreme values (> 5 std from mean)
-                    if params['std'] != 0:
-                        zscore = np.abs((result_df.loc[mask, quantile] - params['mean']) / params['std'])
-                        outliers = (zscore > 5).sum()
-                        if outliers > 0:
-                            self.logger.warning(
-                                f"{outliers} extreme outliers in restored forecasts for "
-                                f"{currency}-{branch} {quantile} (>5 std from mean)"
-                            )
-
-            # Add scaling metadata to result
-            result_df.attrs['scaling_restored'] = True
-            result_df.attrs['scaling_timestamp'] = self.timestamp
-
-            return result_df
-
-        except Exception as e:
-            self.logger.error(f"Error in _get_forecast_result: {e}")
-            self.logger.error(f"Forecast shape: {forecast_df.shape if 'forecast_df' in locals() else 'not created'}")
-            self.logger.error(
-                f"Inference shape: {inference_data.shape if 'inference_data' in locals() else 'not created'}")
-            raise
-        finally:
-            # Cleanup
-            if os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir)
-                except Exception as e:
-                    self.logger.warning(f"Failed to remove temp directory {temp_dir}: {e}")
-
-    def _save_forecasts(self, country_code: str, forecasts_df: pd.DataFrame) -> None:
-        """Save the forecasts with appropriate format."""
-        # Required columns
-        required_columns = [
-                               'ProductId', 'BranchId', 'Currency',
-                               'EffectiveDate', 'ForecastDate'] + self.config.quantiles
-
-        self.logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
-
-        for col in required_columns:
-            if col not in forecasts_df.columns:
-                raise ValueError(f"Column '{col}' is missing from forecasts DataFrame.")
-
-        # Convert date columns to datetime
-        forecasts_df['EffectiveDate'] = pd.to_datetime(forecasts_df['EffectiveDate'])
-        forecasts_df['ForecastDate'] = pd.to_datetime(forecasts_df['ForecastDate'])
-
-        # Ensure quantile columns are numeric
-        try:
-            forecasts_df[self.config.quantiles] = forecasts_df[self.config.quantiles].apply(pd.to_numeric,
-                                                                                            errors='coerce')
-        except Exception as e:
-            self.logger.error(f"Failed to convert quantile columns to numeric: {e}")
-            raise ValueError("Quantile columns contain non-numeric values.")
-
-        # Calculate 'ForecastDay'
-        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
-
-        # Filter forecasts within horizon
-        forecasts_df = forecasts_df[
-            (forecasts_df['ForecastDay'] >= 1) & (forecasts_df['ForecastDay'] <= self.config.forecast_horizon)]
-
-        # Pivot the data
-        try:
-            forecasts_pivot = forecasts_df.pivot_table(
-                index=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
-                columns='ForecastDay',
-                values=self.config.quantiles,
-                aggfunc='mean'  # Explicitly specify the aggregation function
-            )
-        except Exception as e:
-            self.logger.error(f"Pivot table aggregation failed: {e}")
-            raise ValueError("Aggregation function failed due to non-numeric quantile columns.")
-
-        # Rename columns to include quantile and day information
-        forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
-                                   for quantile, day in forecasts_pivot.columns]
-
-        # Reset index
-        forecasts_pivot.reset_index(inplace=True)
-
-        # Save results
-        output_file = f"./results/{country_code}_{self.timestamp}/final_forecast.csv"
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        forecasts_pivot.to_csv(output_file, index=False)
-        self.logger.info(f"Final forecast saved to {output_file}")
 
     def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False) -> None:
         """Run the complete forecasting pipeline."""
         try:
-            # Prepare data
-            train_file, template_file = self.prepare_data(input_file, country_code)
+            self.logger.info(f"Running pipeline for country: {country_code}")
+
+            # Load data using DataProcessor
+            data = self.data_processor.load_data(input_file)
+
+            # Prepare and scale data
+            scaled_data, scaling_params = self.data_processor.prepare_data(data)
+
+            # Create directories for output
+            self.output_dir = Path(f"./cs_data/cash/{country_code}_{self.timestamp}")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save scaling parameters
+            scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
+            self.data_processor.save_scaling_params(scaling_params, scaling_file)
+
+            # Generate and save scaling metadata
+            metadata = self.data_processor.generate_scaling_metadata(data, scaling_params)
+            metadata_file = self.output_dir / f"{country_code}_scaling_metadata.json"
+            self.data_processor.save_metadata(metadata, metadata_file)
+
+            # Save scaled training data
+            train_file = self.output_dir / f"{country_code}_train.csv"
+            scaled_data.to_csv(train_file, index=False)
+            self.train_file = str(train_file)
+            self.logger.info(f"Saved scaled training data to {train_file}")
+
+            # Create and save inference template
+            inference_template = data.drop_duplicates(
+                subset=['ProductId', 'BranchId', 'Currency']
+            )[['ProductId', 'BranchId', 'Currency']]
+            inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
+            inference_template.to_csv(inference_template_file, index=False)
+            self.logger.info(f"Saved inference template to {inference_template_file}")
 
             # Upload training data to S3
-            s3_train_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/train/{os.path.basename(train_file)}"
-            self._safe_s3_upload(train_file, s3_train_key)
-            train_data_s3_uri = f"s3://{self.config.bucket}/{os.path.dirname(s3_train_key)}/"
+            train_data_s3_uri = self.upload_training_data(str(train_file), country_code)
 
             # Train model
-            job_name = self.train_model(
-                country_code,
-                train_data_s3_uri
-            )
+            job_name = self.train_model(country_code, train_data_s3_uri)
 
             # Monitor training
             status = self._monitor_job(job_name)
@@ -729,53 +396,45 @@ class CashForecastingPipeline:
             model_name = self._get_best_model(job_name, country_code)
 
             # Forecasting
-            self.forecast(country_code, model_name, template_file, backtesting=backtesting)
+            self.forecast(country_code, model_name, str(inference_template_file), backtesting=backtesting)
+
+            self.logger.info(f"Pipeline completed successfully for {country_code}")
 
         except Exception as e:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
             raise
 
 
-# Modify the argument parser to include --input_file
 def main():
-    parser = argparse.ArgumentParser(description='Cash Forecasting Pipeline')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to configuration YAML file')
-    parser.add_argument('--countries', nargs='+', default=['ZM'],
-                        help='Country codes to process')
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume pipeline from last checkpoint')
-    parser.add_argument('--input_file', type=str, default=None,
-                        help='Path to the input CSV file (overrides default)')
-    args = parser.parse_args()
+    """Main entry point for the cash forecasting model script."""
+    # Parse command line arguments using common.py's parser
+    args = parse_arguments()
 
-    # Load and validate configuration
-    with open(args.config, 'r') as f:
-        config_dict = yaml.safe_load(f)
-
+    # Load and validate configuration using common.py's load_config
     try:
-        # First validate with Pydantic
-        config_model = ConfigModel(**config_dict)
-        # Then create Config dataclass
-        config = Config(**config_model.dict())
+        config = load_config(args.config)
     except Exception as e:
         logging.error(f"Configuration error: {str(e)}")
         sys.exit(1)
 
+    # Setup logging using common.py's setup_logging
+    timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
+    logger = setup_logging(timestamp)
+
+    # Initialize and run the pipeline for each specified country
     for country_code in args.countries:
-        pipeline = CashForecastingPipeline(config)
+        pipeline = CashForecastingPipeline(config=config, logger=logger)
         try:
-            if args.input_file:
-                input_file = args.input_file
-            else:
-                input_file = f"./data/cash/{country_code}.csv"
-            if not os.path.exists(input_file):
+            # Determine input file path
+            input_file = args.input_file if args.input_file else f"./data/cash/{country_code}.csv"
+            if not Path(input_file).exists():
                 raise FileNotFoundError(f"Input file not found: {input_file}")
 
-            pipeline.run_pipeline(country_code, input_file, backtesting=False)
+            # Run the pipeline
+            pipeline.run_pipeline(country_code=country_code, input_file=input_file, backtesting=args.resume)
 
         except Exception as e:
-            logging.error(f"Failed to process {country_code}: {str(e)}")
+            logger.error(f"Failed to process {country_code}: {str(e)}")
 
 
 if __name__ == "__main__":
