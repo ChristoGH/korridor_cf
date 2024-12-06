@@ -16,10 +16,22 @@ import json
 from time import gmtime, strftime, sleep
 from typing import Dict, Tuple, List, Any, Optional
 from dataclasses import dataclass, field
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, ValidationError
 import yaml
 from pathlib import Path
 import shutil
+
+
+class MonitoringDatasetFormat(BaseModel):
+    """Pydantic model for monitoring dataset format."""
+    json_format: str  # Renamed from 'json' to 'json_format' to avoid shadowing
+    # Add other fields as necessary
+
+    @field_validator('json_format')
+    def json_format_must_be_valid(cls, v):
+        if not v.startswith('{') or not v.endswith('}'):
+            raise ValueError('json_format must be a valid JSON string')
+        return v
 
 
 class ConfigModel(BaseModel):
@@ -146,7 +158,7 @@ class DataProcessor:
         self.logger = logger
         self.required_columns = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'Demand']
 
-    def load_data(self, file_path: str) -> pd.DataFrame:
+    def load_data(self, file_path: str | Path) -> pd.DataFrame:
         """
         Load data from a CSV file.
 
@@ -359,13 +371,6 @@ class DataProcessor:
                 )
 
                 # Check for anomalies
-                if restored_stats['min'] < 0:
-                    logger.warning(
-                        f"Negative values in restored forecasts for {currency}-{branch} {quantile}: "
-                        f"min={restored_stats['min']:.2f}"
-                    )
-
-                # Check for extreme values (> 5 std from mean)
                 if params['std'] != 0:
                     zscore = np.abs((result_df.loc[mask, quantile] - params['mean']) / params['std'])
                     outliers = (zscore > 5).sum()
@@ -426,7 +431,7 @@ class DataProcessor:
             self.logger.error(f"Failed to save scaling metadata to {metadata_file}: {e}")
             raise
 
-    def get_effective_dates(self, train_file: str, backtesting: bool) -> List[pd.Timestamp]:
+    def get_effective_dates(self, train_file: str | Path, backtesting: bool) -> List[pd.Timestamp]:
         """
         Retrieve effective dates from training data for forecasting.
 
@@ -497,15 +502,16 @@ class DataProcessor:
         self.logger.info(f"Generated inference data with shape {inference_data.shape}")
         return inference_data
 
-    def retrieve_forecast_results(self, s3_client, bucket: str, prefix: str, output_dir: Path) -> pd.DataFrame:
+    def retrieve_forecast_results(self, s3_handler: S3Handler, bucket: str, prefix: str, output_dir: Path, quantiles: List[str]) -> pd.DataFrame:
         """
         Download and combine forecast result files from S3.
 
         Args:
-            s3_client: Boto3 S3 client
+            s3_handler: Instance of S3Handler
             bucket: S3 bucket name
             prefix: S3 prefix where forecast results are stored
             output_dir: Local directory to download files
+            quantiles: List of quantile names
 
         Returns:
             Combined forecast DataFrame
@@ -515,8 +521,10 @@ class DataProcessor:
             Exception: For other download or processing errors
         """
         try:
-            objects = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-            if 'Contents' not in objects:
+            objects = s3_handler.list_s3_objects(bucket=bucket, prefix=prefix)
+            forecast_keys = [obj['Key'] for obj in objects if obj['Key'].endswith('.out')]
+
+            if not forecast_keys:
                 self.logger.error(f"No forecast output files found in s3://{bucket}/{prefix}")
                 raise FileNotFoundError(f"No forecast output files found in s3://{bucket}/{prefix}")
 
@@ -525,31 +533,33 @@ class DataProcessor:
             temp_dir.mkdir(parents=True, exist_ok=True)
 
             forecast_data = []
-            for obj in objects['Contents']:
-                s3_key = obj['Key']
-                if s3_key.endswith('.out'):
-                    local_file = temp_dir / Path(s3_key).name
-                    s3_client.download_file(bucket, s3_key, str(local_file))
-                    self.logger.info(f"Downloaded forecast file {s3_key} to {local_file}")
+            for key in forecast_keys:
+                local_file = temp_dir / Path(key).name
+                s3_handler.download_file(bucket=bucket, s3_key=key, local_path=local_file)
+                self.logger.info(f"Downloaded forecast file {key} to {local_file}")
 
-                    # Read the forecast output
-                    try:
-                        df = pd.read_csv(local_file, header=None)
-                        num_columns = len(df.columns)
-                        self.logger.info(f"Forecast file {s3_key} has {num_columns} columns.")
+                # Read forecast data (assuming CSV format without headers)
+                try:
+                    df = pd.read_csv(local_file, header=None)
+                    num_columns = len(df.columns)
+                    self.logger.info(f"Forecast file {key} has {num_columns} columns.")
 
-                        # Assume the last N columns correspond to the quantiles
-                        quantile_cols = df.columns[-len(self.config.quantiles):]
-                        df_subset = df[quantile_cols]
-                        df_subset.columns = self.config.quantiles
-                        forecast_data.append(df_subset)
-                        self.logger.info(f"Processed forecast file {s3_key} with shape {df_subset.shape}")
-                    except Exception as e:
-                        self.logger.error(f"Failed to process forecast file {s3_key}: {e}")
-                        continue
-                    finally:
-                        # Remove the local file after processing
-                        local_file.unlink(missing_ok=True)
+                    # Assign quantile columns based on config.quantiles
+                    if num_columns != len(quantiles):
+                        self.logger.warning(f"Expected {len(quantiles)} quantiles, but got {num_columns} in file {key}")
+                        # Adjust column names accordingly
+                        df.columns = [f"Quantile_{i+1}" for i in range(num_columns)]
+                    else:
+                        df.columns = quantiles
+
+                    forecast_data.append(df)
+                    self.logger.info(f"Processed forecast file {key} with shape {df.shape}")
+                except Exception as e:
+                    self.logger.error(f"Failed to process forecast file {key}: {e}")
+                    continue
+                finally:
+                    # Remove the local file after processing
+                    local_file.unlink(missing_ok=True)
 
             if not forecast_data:
                 self.logger.error("No valid forecast data found.")
@@ -564,6 +574,10 @@ class DataProcessor:
             self.logger.info(f"Cleaned up temporary forecast directory {temp_dir}")
 
             return forecast_df
+
+        except Exception as e:
+            self.logger.error(f"Failed to retrieve forecast results: {e}")
+            raise
 
     def save_final_forecasts(self,
                              forecasts_df: pd.DataFrame,
@@ -584,65 +598,70 @@ class DataProcessor:
         Raises:
             ValueError: If required columns are missing or data types are incorrect
         """
-        required_columns = [
-            'ProductId', 'BranchId', 'Currency',
-            'EffectiveDate', 'ForecastDate'
-        ] + config.quantiles
-
-        logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
-
-        for col in required_columns:
-            if col not in forecasts_df.columns:
-                logger.error(f"Column '{col}' is missing from forecasts DataFrame.")
-                raise ValueError(f"Column '{col}' is missing from forecasts DataFrame.")
-
-        # Convert date columns to datetime
-        for date_col in ['EffectiveDate', 'ForecastDate']:
-            forecasts_df[date_col] = pd.to_datetime(forecasts_df[date_col]).dt.tz_localize(None)
-
-        # Ensure quantile columns are numeric
         try:
-            forecasts_df[config.quantiles] = forecasts_df[config.quantiles].apply(pd.to_numeric, errors='coerce')
-            logger.info("Converted quantile columns to numeric.")
+            required_columns = [
+                'ProductId', 'BranchId', 'Currency',
+                'EffectiveDate', 'ForecastDate'
+            ] + config.quantiles
+
+            logger.info(f"Forecast df columns: {forecasts_df.columns.tolist()}")
+
+            for col in required_columns:
+                if col not in forecasts_df.columns:
+                    logger.error(f"Column '{col}' is missing from forecasts DataFrame.")
+                    raise ValueError(f"Column '{col}' is missing from forecasts DataFrame.")
+
+            # Convert date columns to datetime
+            for date_col in ['EffectiveDate', 'ForecastDate']:
+                forecasts_df[date_col] = pd.to_datetime(forecasts_df[date_col]).dt.tz_localize(None)
+
+            # Ensure quantile columns are numeric
+            try:
+                forecasts_df[config.quantiles] = forecasts_df[config.quantiles].apply(pd.to_numeric, errors='coerce')
+                logger.info("Converted quantile columns to numeric.")
+            except Exception as e:
+                logger.error(f"Failed to convert quantile columns to numeric: {e}")
+                raise ValueError("Quantile columns contain non-numeric values.")
+
+            # Calculate 'ForecastDay'
+            forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
+
+            # Filter forecasts within horizon
+            forecasts_df = forecasts_df[
+                (forecasts_df['ForecastDay'] >= 1) & (forecasts_df['ForecastDay'] <= config.forecast_horizon)
+            ]
+            logger.info(f"Filtered forecasts within horizon, resulting shape: {forecasts_df.shape}")
+
+            # Pivot the data
+            try:
+                forecasts_pivot = forecasts_df.pivot_table(
+                    index=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
+                    columns='ForecastDay',
+                    values=config.quantiles,
+                    aggfunc='mean'  # Explicitly specify the aggregation function
+                )
+                logger.info("Pivoted forecast data successfully.")
+            except Exception as e:
+                logger.error(f"Pivot table aggregation failed: {e}")
+                raise ValueError("Aggregation function failed due to non-numeric quantile columns.")
+
+            # Rename columns to include quantile and day information
+            forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
+                                       for quantile, day in forecasts_pivot.columns]
+            logger.info("Renamed forecast columns with quantile and day information.")
+
+            # Reset index
+            forecasts_pivot.reset_index(inplace=True)
+
+            # Save results
+            output_file = Path(f"./results/{country_code}_{timestamp}/final_forecast.csv")
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            forecasts_pivot.to_csv(output_file, index=False)
+            logger.info(f"Final forecast saved to {output_file}")
+
         except Exception as e:
-            logger.error(f"Failed to convert quantile columns to numeric: {e}")
-            raise ValueError("Quantile columns contain non-numeric values.")
-
-        # Calculate 'ForecastDay'
-        forecasts_df['ForecastDay'] = (forecasts_df['ForecastDate'] - forecasts_df['EffectiveDate']).dt.days + 1
-
-        # Filter forecasts within horizon
-        forecasts_df = forecasts_df[
-            (forecasts_df['ForecastDay'] >= 1) & (forecasts_df['ForecastDay'] <= config.forecast_horizon)
-        ]
-        logger.info(f"Filtered forecasts within horizon, resulting shape: {forecasts_df.shape}")
-
-        # Pivot the data
-        try:
-            forecasts_pivot = forecasts_df.pivot_table(
-                index=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
-                columns='ForecastDay',
-                values=config.quantiles,
-                aggfunc='mean'  # Explicitly specify the aggregation function
-            )
-            logger.info("Pivoted forecast data successfully.")
-        except Exception as e:
-            logger.error(f"Pivot table aggregation failed: {e}")
-            raise ValueError("Aggregation function failed due to non-numeric quantile columns.")
-
-        # Rename columns to include quantile and day information
-        forecasts_pivot.columns = [f"{quantile}_Day{int(day)}"
-                                   for quantile, day in forecasts_pivot.columns]
-        logger.info("Renamed forecast columns with quantile and day information.")
-
-        # Reset index
-        forecasts_pivot.reset_index(inplace=True)
-
-        # Save results
-        output_file = Path(f"./results/{country_code}_{timestamp}/final_forecast.csv")
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        forecasts_pivot.to_csv(output_file, index=False)
-        logger.info(f"Final forecast saved to {output_file}")
+            logger.error(f"Failed to save final forecasts: {e}")
+            raise
 
 
 def setup_logging(timestamp: str, name: str = 'CashForecast') -> logging.Logger:
@@ -665,7 +684,9 @@ def setup_logging(timestamp: str, name: str = 'CashForecast') -> logging.Logger:
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
         # File handler
-        fh = logging.FileHandler(f'cash_forecast_{timestamp}.log')
+        log_dir = Path('./logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_dir / f'cash_forecast_{timestamp}.log')
         fh.setLevel(logging.INFO)
         fh.setFormatter(formatter)
 
@@ -681,7 +702,7 @@ def setup_logging(timestamp: str, name: str = 'CashForecast') -> logging.Logger:
     return logger
 
 
-def load_config(config_path: str) -> Config:
+def load_config(config_path: str | Path) -> Config:
     """
     Load and validate configuration from YAML file.
 
@@ -704,6 +725,8 @@ def load_config(config_path: str) -> Config:
         # Create Config instance
         config = Config(**config_model.dict())
         return config
+    except ValidationError as ve:
+        raise Exception(f"Configuration validation error: {ve}")
     except Exception as e:
         raise Exception(f"Failed to load configuration: {str(e)}")
 
@@ -739,4 +762,3 @@ def parse_arguments(inference: bool = False) -> argparse.Namespace:
                             help='Path to the inference template CSV file')
 
     return parser.parse_args()
-

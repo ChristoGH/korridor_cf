@@ -1,25 +1,28 @@
 # cash_forecast_model.py
 
 """
+# cash_forecast_model.py
+# Usage:
+# python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
 Cash Forecasting Model Building Script
 
 This script builds and trains forecasting models for cash demand using the provided configuration.
 It leverages shared utilities from common.py for configuration management, data processing,
 logging, and AWS interactions.
 """
-
+from time import sleep
 import argparse
 import sys
 from pathlib import Path
 from time import gmtime, strftime
-
+import logging
 import boto3
 import pandas as pd
 import numpy as np
 from sagemaker import Session
+from typing import Tuple
 
 from common import (
-    ConfigModel,
     Config,
     S3Handler,
     DataProcessor,
@@ -43,7 +46,7 @@ class CashForecastingPipeline:
         self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
         self.role = self.config.role_arn
         self.train_file = None
-        self.output_dir = None  # Will be set in prepare_data
+        self.output_dir = None  # Will be set in run_pipeline
 
     def prepare_data(self, input_file: str, country_code: str) -> Tuple[str, str]:
         """Prepare data for training and create inference template."""
@@ -123,8 +126,10 @@ class CashForecastingPipeline:
                         'TargetAttributeName': 'Demand',
                         'TimestampAttributeName': 'EffectiveDate',
                         'ItemIdentifierAttributeName': 'ProductId',
-                        'GroupingAttributeNames': ['BranchId', 'Currency']
+                        'GroupingAttributeNames': ['BranchId', 'Currency'],
+                        'CategoricalFeatures': ['ProductId', 'BranchId', 'Currency']
                     }
+
                 }
             },
             'RoleArn': self.role
@@ -207,78 +212,6 @@ class CashForecastingPipeline:
 
         return model_name
 
-    def forecast(self, country_code: str, model_name: str, template_file: str,
-                 backtesting: bool = False) -> pd.DataFrame:
-        """Generate forecasts using the trained model."""
-        self.logger.info(f"Starting forecasting for country: {country_code}")
-
-        # Load inference template using DataProcessor
-        inference_template = self.data_processor.load_data(template_file)
-
-        # Retrieve effective dates using DataProcessor
-        effective_dates = self.data_processor.get_effective_dates(train_file=self.train_file, backtesting=backtesting)
-
-        # Generate inference data in batches
-        batch_size = self.config.batch_size
-        forecast_df = pd.DataFrame()
-
-        for batch_number, batch_dates in enumerate(
-                self.data_processor.chunk_list(effective_dates, batch_size), start=1):
-            self.logger.info(f"Processing batch {batch_number} with {len(batch_dates)} dates.")
-
-            # Generate inference data
-            inference_data = self.data_processor.generate_inference_data(
-                inference_template=inference_template,
-                batch_dates=batch_dates,
-                forecast_horizon=self.config.forecast_horizon
-            )
-
-            # Save inference data to CSV
-            inference_file = self.output_dir / f"{country_code}_inference_batch_{batch_number}.csv"
-            inference_data.to_csv(inference_file, index=False)
-            self.logger.info(f"Saved inference batch to {inference_file}")
-
-            # Upload inference data to S3 using S3Handler
-            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference/{inference_file.name}"
-            self.s3_handler.safe_upload(local_path=str(inference_file), bucket=self.config.bucket,
-                                        s3_key=s3_inference_key, overwrite=True)
-            s3_inference_data_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
-            self.logger.info(f"Uploaded inference batch to {s3_inference_data_uri}")
-
-            # Run batch transform
-            self._run_batch_transform_job(country_code, model_name, s3_inference_data_uri, batch_number)
-
-        # Retrieve and combine forecast results
-        forecast_df = self.data_processor.retrieve_forecast_results(
-            s3_client=self.s3_handler.client,
-            bucket=self.config.bucket,
-            prefix=f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/",
-            output_dir=self.output_dir
-        )
-
-        # Load scaling parameters
-        scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
-        scaling_params = self.data_processor.load_scaling_params(scaling_file=scaling_file)
-
-        # Restore scaling
-        restored_forecast_df = self.data_processor.restore_scaling(
-            forecast_df=forecast_df,
-            scaling_params=scaling_params,
-            quantiles=self.config.quantiles,
-            logger=self.logger
-        )
-
-        # Save final forecasts
-        self.data_processor.save_final_forecasts(
-            forecasts_df=restored_forecast_df,
-            country_code=country_code,
-            timestamp=self.timestamp,
-            config=self.config,
-            logger=self.logger
-        )
-
-        self.logger.info(f"Forecasting completed for country: {country_code}")
-        return restored_forecast_df
 
     def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
                                  batch_number: int) -> None:
@@ -344,45 +277,30 @@ class CashForecastingPipeline:
                 sleep(60)  # Wait before retrying
 
     def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False) -> None:
-        """Run the complete forecasting pipeline."""
+        """
+        Run the model building pipeline.
+
+        This method handles data preparation, uploads training data to S3,
+        initiates model training via SageMaker AutoML, monitors the training job,
+        and retrieves the best model.
+
+        Args:
+            country_code (str): The country code for which to build the model.
+            input_file (str): Path to the input CSV file.
+            backtesting (bool): Flag to indicate if backtesting is to be performed.
+
+        Raises:
+            RuntimeError: If the training job fails to complete successfully.
+        """
+
         try:
             self.logger.info(f"Running pipeline for country: {country_code}")
 
-            # Load data using DataProcessor
-            data = self.data_processor.load_data(input_file)
-
-            # Prepare and scale data
-            scaled_data, scaling_params = self.data_processor.prepare_data(data)
-
-            # Create directories for output
-            self.output_dir = Path(f"./cs_data/cash/{country_code}_{self.timestamp}")
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save scaling parameters
-            scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
-            self.data_processor.save_scaling_params(scaling_params, scaling_file)
-
-            # Generate and save scaling metadata
-            metadata = self.data_processor.generate_scaling_metadata(data, scaling_params)
-            metadata_file = self.output_dir / f"{country_code}_scaling_metadata.json"
-            self.data_processor.save_metadata(metadata, metadata_file)
-
-            # Save scaled training data
-            train_file = self.output_dir / f"{country_code}_train.csv"
-            scaled_data.to_csv(train_file, index=False)
-            self.train_file = str(train_file)
-            self.logger.info(f"Saved scaled training data to {train_file}")
-
-            # Create and save inference template
-            inference_template = data.drop_duplicates(
-                subset=['ProductId', 'BranchId', 'Currency']
-            )[['ProductId', 'BranchId', 'Currency']]
-            inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
-            inference_template.to_csv(inference_template_file, index=False)
-            self.logger.info(f"Saved inference template to {inference_template_file}")
+            # Load and prepare data
+            train_file, inference_template_file = self.prepare_data(input_file, country_code)
 
             # Upload training data to S3
-            train_data_s3_uri = self.upload_training_data(str(train_file), country_code)
+            train_data_s3_uri = self.upload_training_data(train_file, country_code)
 
             # Train model
             job_name = self.train_model(country_code, train_data_s3_uri)
@@ -395,10 +313,7 @@ class CashForecastingPipeline:
             # Get best model
             model_name = self._get_best_model(job_name, country_code)
 
-            # Forecasting
-            self.forecast(country_code, model_name, str(inference_template_file), backtesting=backtesting)
-
-            self.logger.info(f"Pipeline completed successfully for {country_code}")
+            self.logger.info(f"Model building pipeline completed successfully for {country_code}")
 
         except Exception as e:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
@@ -406,36 +321,34 @@ class CashForecastingPipeline:
 
 
 def main():
-    """Main entry point for the cash forecasting model script."""
-    # Parse command line arguments using common.py's parser
-    args = parse_arguments()
+    # Parse command line arguments without inference-specific arguments
+    args = parse_arguments()  # inference=False by default
 
-    # Load and validate configuration using common.py's load_config
-    try:
-        config = load_config(args.config)
-    except Exception as e:
-        logging.error(f"Configuration error: {str(e)}")
-        sys.exit(1)
-
-    # Setup logging using common.py's setup_logging
+    # Setup logging
     timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
-    logger = setup_logging(timestamp)
+    logger = setup_logging(timestamp, name='CashForecastModel')
+    logger.info("Starting Cash Forecasting Model Training Pipeline")
 
-    # Initialize and run the pipeline for each specified country
-    for country_code in args.countries:
+    try:
+        # Load configuration
+        config = load_config(args.config)
+        logger.info("Configuration loaded successfully.")
+
+        # Initialize and run the pipeline (assuming CashForecastingPipeline class exists)
         pipeline = CashForecastingPipeline(config=config, logger=logger)
-        try:
-            # Determine input file path
-            input_file = args.input_file if args.input_file else f"./data/cash/{country_code}.csv"
-            if not Path(input_file).exists():
-                raise FileNotFoundError(f"Input file not found: {input_file}")
+        pipeline.run_pipeline(
+            country_code=args.countries[0],
+            input_file=args.input_file or f"./data/cash/{args.countries[0]}.csv",
+            backtesting=args.resume
+        )
 
-            # Run the pipeline
-            pipeline.run_pipeline(country_code=country_code, input_file=input_file, backtesting=args.resume)
+        logger.info("Model training pipeline completed successfully.")
 
-        except Exception as e:
-            logger.error(f"Failed to process {country_code}: {str(e)}")
-
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
+
+
