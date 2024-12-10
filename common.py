@@ -262,6 +262,22 @@ class DataProcessor:
             )
         return scaled_data
 
+    def load_scaling_metadata(self, scaling_metadata_file: Path) -> Dict[str, Any]:
+        """
+        Load scaling metadata from a JSON file.
+        """
+        try:
+            with open(scaling_metadata_file, 'r') as f:
+                metadata = json.load(f)
+            self.logger.info(f"Loaded scaling metadata from {scaling_metadata_file}")
+            return metadata
+        except FileNotFoundError:
+            self.logger.error(f"Scaling metadata file not found: {scaling_metadata_file}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Failed to load scaling metadata from {scaling_metadata_file}: {e}")
+            raise
+
     def save_scaling_params(self, scaling_params: Dict[Tuple[str, str], Dict[str, float]], scaling_file: Path) -> None:
         """
         Save scaling parameters to a JSON file.
@@ -282,6 +298,22 @@ class DataProcessor:
         except Exception as e:
             self.logger.error(f"Failed to save scaling parameters to {scaling_file}: {e}")
             raise
+
+    def validate_scaling_parameters(self, scaling_params: Dict[Tuple[str, str], Dict[str, float]]) -> None:
+        """
+        Validate the structure and content of scaling parameters.
+
+        Args:
+            scaling_params (dict): Scaling parameters to validate.
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        required_keys = {'mean', 'std', 'min', 'max', 'last_value', 'n_observations'}
+        for group, params in scaling_params.items():
+            if not required_keys.issubset(params.keys()):
+                missing = required_keys - set(params.keys())
+                raise ValueError(f"Scaling parameters for group {group} are missing keys: {missing}")
 
     def load_scaling_params(self, scaling_file: Path) -> Dict[Tuple[str, str], Dict[str, float]]:
         """

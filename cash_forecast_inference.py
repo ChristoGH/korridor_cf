@@ -6,13 +6,16 @@ Cash Forecasting Inference Script
 This script performs inference using a trained forecasting model on new data.
 It leverages shared utilities from common.py for configuration management,
 data processing, logging, and AWS interactions.
+
+python cs_scripts/cash_forecast_inference.py   --config cs_scripts/config.yaml   --countries ZM   --model_timestamp 20241209-035546   --effective_date 2024-12-09   --model_name ZM-model-20241209-035546   --inference_template ./cs_data/cash/ZM_20241209-035546/ZM_inference_template.csv
 """
 
-import argparse
+import shutil  # Add this import at the top of the script
 import sys
 from pathlib import Path
 from time import gmtime, strftime, sleep
 from datetime import datetime
+import logging
 
 import pandas as pd
 import numpy as np
@@ -62,8 +65,8 @@ class CashForecastingPipeline:
             ValueError: If scaling parameters or metadata are invalid.
         """
         self.logger.info(f"Loading scaling parameters for country: {country_code}")
-        scaling_params_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_params.json"
-        scaling_metadata_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/scaling/{country_code}_scaling_metadata.json"
+        scaling_params_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/{country_code}_scaling_params.json"
+        scaling_metadata_key = f"{self.config.prefix}-{country_code}/{model_timestamp}/{country_code}_scaling_metadata.json"
 
         # Download scaling parameters
         scaling_params_path = Path(f"./temp/{country_code}_scaling_params.json")
@@ -73,7 +76,7 @@ class CashForecastingPipeline:
         # Download scaling metadata
         scaling_metadata_path = Path(f"./temp/{country_code}_scaling_metadata.json")
         self.s3_handler.download_file(bucket=self.config.bucket, s3_key=scaling_metadata_key, local_path=scaling_metadata_path)
-        scaling_metadata = self.data_processor.load_scaling_params(scaling_file=scaling_metadata_path)  # Assuming similar structure
+        scaling_metadata = self.data_processor.load_scaling_metadata(scaling_metadata_file=scaling_metadata_path)
 
         # Validate scaling parameters
         self.data_processor.validate_scaling_parameters(scaling_params)
@@ -91,54 +94,49 @@ class CashForecastingPipeline:
     def prepare_inference_data(self, country_code: str, effective_date: str, inference_template_path: str) -> str:
         """
         Prepare the inference data based on the provided template and effective date.
-
-        Args:
-            country_code (str): The country code.
-            effective_date (str): The effective date for forecasting.
-            inference_template_path (str): Path to the inference template CSV file.
-
-        Returns:
-            str: Path to the prepared inference CSV file.
-
-        Raises:
-            ValueError: If data preparation fails.
         """
         self.logger.info(f"Preparing inference data for country: {country_code}")
         try:
-            # Load inference template
-            inference_template = self.data_processor.load_data(inference_template_path)
-            self.logger.info(f"Inference template loaded with shape {inference_template.shape}")
+            # Load the inference template
+            inference_template_df = self.data_processor.load_data(inference_template_path)
+            # Ensure the inference template is not empty
+            if inference_template_df.empty:
+                raise ValueError("Inference template is empty. No combinations available from the training data.")
 
-            # Validate inference template columns
-            required_columns = {'ProductId', 'BranchId', 'Currency'}
-            if not required_columns.issubset(inference_template.columns):
-                missing = required_columns - set(inference_template.columns)
-                self.logger.error(f"Inference template is missing required columns: {missing}")
-                raise ValueError(f"Inference template is missing required columns: {missing}")
+            # Log the number of combinations to be used
+            num_combinations = len(inference_template_df)
+            self.logger.info(f"Number of valid combinations for inference: {num_combinations}")
+
+            # Validate that all combinations in the template have scaling parameters
+            valid_combinations = set(self.scaling_params.keys())
+            self.logger.debug(f"Valid combinations: {valid_combinations}")
+            inference_template_df['IsValid'] = inference_template_df.apply(
+                lambda row: (row['Currency'], str(row['BranchId'])) in valid_combinations, axis=1
+            )
+            invalid_combinations = inference_template_df[~inference_template_df['IsValid']]
+            if not invalid_combinations.empty:
+                self.logger.error(f"Missing scaling parameters for combinations:\n{invalid_combinations}")
+                raise ValueError(f"Missing scaling parameters for some combinations in the inference template.")
+
+            # Proceed with valid combinations only
+            inference_template_df = inference_template_df[inference_template_df['IsValid']].drop(columns=['IsValid'])
+            self.logger.info(f"Filtered inference template to {len(inference_template_df)} valid combinations.")
 
             # Generate future dates based on effective_date and forecast_horizon
             effective_date_dt = pd.to_datetime(effective_date)
-            future_dates = [effective_date_dt + pd.Timedelta(days=i) for i in range(1, self.config.forecast_horizon + 1)]
+            future_dates = [effective_date_dt + pd.Timedelta(days=i) for i in
+                            range(1, self.config.forecast_horizon + 1)]
 
-            # Create inference DataFrame
-            num_combinations = len(inference_template)
+            # Create the inference DataFrame using the entire template
             inference_data = pd.DataFrame({
-                'ProductId': np.tile(inference_template['ProductId'].values, self.config.forecast_horizon),
-                'BranchId': np.tile(inference_template['BranchId'].values, self.config.forecast_horizon),
-                'Currency': np.tile(inference_template['Currency'].values, self.config.forecast_horizon),
+                'ProductId': np.tile(inference_template_df['ProductId'].values, self.config.forecast_horizon),
+                'BranchId': np.tile(inference_template_df['BranchId'].values, self.config.forecast_horizon),
+                'Currency': np.tile(inference_template_df['Currency'].values, self.config.forecast_horizon),
                 'EffectiveDate': effective_date_dt,
-                'ForecastDate': np.repeat(future_dates, num_combinations),
+                'ForecastDate': np.repeat(future_dates, len(inference_template_df)),
                 'Demand': np.nan  # Placeholder for unknown demand
             })
             self.logger.info(f"Inference data generated with shape {inference_data.shape}")
-
-            # Validate against scaling parameters
-            template_combinations = set(zip(inference_template['Currency'], inference_template['BranchId']))
-            scaling_combinations = set(self.scaling_params.keys())
-            missing_combinations = template_combinations - scaling_combinations
-            if missing_combinations:
-                self.logger.error(f"Missing scaling parameters for combinations: {missing_combinations}")
-                raise ValueError(f"Missing scaling parameters for combinations: {missing_combinations}")
 
             # Save inference data to CSV
             self.output_dir = Path(f"./inference_results/{country_code}_{self.timestamp}")
@@ -229,11 +227,9 @@ class CashForecastingPipeline:
         """
         Monitor the SageMaker transform job until completion.
 
-        Args:
-            transform_job_name (str): The name of the transform job.
-
-        Raises:
-            RuntimeError: If the transform job fails.
+        Exits cleanly when job completes, fails, or stops. If an exception occurs
+        while describing the job, it logs and re-raises to halt execution and avoid
+        an infinite loop.
         """
         self.logger.info(f"Monitoring transform job: {transform_job_name}")
         sleep_time = 30  # Start with 30 seconds
@@ -248,15 +244,21 @@ class CashForecastingPipeline:
                     if status != 'Completed':
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
-                        raise RuntimeError(f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
+                        # Raise an error to exit the function and stop further monitoring
+                        raise RuntimeError(
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}"
+                        )
                     self.logger.info(f"Transform job {transform_job_name} completed successfully.")
                     break
 
+                # If the job is still in progress, wait and try again
                 sleep(sleep_time)
                 sleep_time = min(sleep_time * 1.5, 600)  # Exponential backoff up to 10 minutes
+
             except Exception as e:
-                self.logger.error(f"Error monitoring transform job {transform_job_name}: {e}")
-                sleep(60)  # Wait before retrying
+                # Log the error and re-raise it to prevent infinite looping
+                self.logger.error(f"Error monitoring transform job {transform_job_name}: {e}", exc_info=True)
+                raise
 
     def download_forecast_results(self, country_code: str) -> pd.DataFrame:
         """
@@ -325,34 +327,31 @@ class CashForecastingPipeline:
             shutil.rmtree(temp_dir)
             self.logger.info(f"Cleaned up temporary forecast downloads at {temp_dir}")
 
-    def restore_forecasts_scale(self, forecast_df: pd.DataFrame) -> pd.DataFrame:
+    def restore_forecasts_scale(self, forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:  # CHANGED
         """
         Restore the original scale of the forecasted Demand values.
 
         Args:
             forecast_df (pd.DataFrame): DataFrame containing forecasted quantiles.
+            country_code (str): The country code.
 
         Returns:
             pd.DataFrame: DataFrame with restored Demand values.
-
-        Raises:
-            ValueError: If required columns are missing.
         """
         self.logger.info("Restoring original scale to forecasted Demand values.")
         try:
-            # Assuming that the forecast_df has the same order as the inference data
-            # and contains the necessary identifiers to map back to Currency and BranchId
-
-            # Load the original inference data to get identifiers
-            inference_csv = self.output_dir / f"{self.config.prefix}-inference_{self.timestamp}.csv"
+            # Use country_code now that it's passed as a parameter
+            inference_csv = self.output_dir / f"{country_code}_inference_{self.timestamp}.csv"
             inference_data = self.data_processor.load_data(str(inference_csv))
 
-            # Assign identifiers to forecast_df
+            # Attempt to align forecast data with inference data
             if len(forecast_df) != len(inference_data):
-                self.logger.warning(f"Forecast data length {len(forecast_df)} does not match inference data length {len(inference_data)}")
-                # Handle mismatch appropriately, possibly by aligning based on some identifiers
+                self.logger.warning(
+                    f"Forecast data length {len(forecast_df)} does not match inference data length {len(inference_data)}")
+                # The code can be extended here if alignment logic is needed.
 
-            # For simplicity, assuming they align
+            # Re-attach Currency, BranchId columns
+            # Assuming forecast_df rows correspond 1:1 with inference_data rows after sorting:
             forecast_df = inference_data[['Currency', 'BranchId']].reset_index(drop=True).join(forecast_df)
 
             # Restore scaling for each group
@@ -361,12 +360,13 @@ class CashForecastingPipeline:
                 for quantile in self.config.quantiles:
                     if quantile in forecast_df.columns:
                         forecast_df.loc[mask, quantile] = (
-                            (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
-                            params['mean']
+                                (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
+                                params['mean']
                         )
                         self.logger.info(f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}")
                     else:
-                        self.logger.warning(f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
+                        self.logger.warning(
+                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
 
             self.logger.info("Scale restoration completed successfully.")
             return forecast_df
@@ -462,7 +462,11 @@ class CashForecastingPipeline:
             forecast_df = self.download_forecast_results(country_code)
 
             # Restore original scale
-            restored_forecast_df = self.restore_forecasts_scale(forecast_df)
+            # Previously:
+            # restored_forecast_df = self.restore_forecasts_scale(forecast_df)
+
+            # Now:
+            restored_forecast_df = self.restore_forecasts_scale(forecast_df, country_code)  # CHANGED
 
             # Save final forecasts
             self.save_final_forecasts(restored_forecast_df, country_code)

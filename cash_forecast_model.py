@@ -4,11 +4,36 @@
 # cash_forecast_model.py
 # Usage:
 # python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
+
 Cash Forecasting Model Building Script
 
 This script builds and trains forecasting models for cash demand using the provided configuration.
 It leverages shared utilities from common.py for configuration management, data processing,
 logging, and AWS interactions.
+
+Approaches to Ensure Long-Term Scalability and Accuracy:
+
+1. Remove or Filter Out Unseen Combinations:
+   This script generates an inference template from the training dataset.
+   Because of this, all (Currency, BranchId) pairs in the inference template
+   are guaranteed to have scaling parameters. No new combinations should appear
+   at inference time unless the inference script uses a different template. If
+   unexpected combinations appear during inference, you would either remove
+   those combinations or ensure the inference template only includes known combinations.
+
+2. Retrain or Update the Model:
+   If the business requires forecasting for new (Currency, BranchId) pairs not
+   present in the training data, you must retrain the model with historical data
+   that includes these new combinations. This ensures scaling parameters and
+   model parameters cover these new entities.
+
+3. Handle Missing Combinations Gracefully:
+   While this training script does not directly handle inference for unseen combinations,
+   you could implement logic during inference to skip or assign default scaling parameters
+   for unseen combinations, at the cost of accuracy. The code below focuses on ensuring
+   that the training pipeline produces all required artifacts for known combinations.
+
+Created model ZM-model-20241206-031017 successfully.
 """
 from time import sleep
 import argparse
@@ -71,6 +96,17 @@ class CashForecastingPipeline:
         metadata_file = self.output_dir / f"{country_code}_scaling_metadata.json"
         self.data_processor.save_metadata(metadata, metadata_file)
 
+        # Upload scaling parameters and metadata to S3
+        s3_scaling_params_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/{country_code}_scaling_params.json"
+        s3_metadata_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/{country_code}_scaling_metadata.json"
+
+        self.s3_handler.safe_upload(local_path=scaling_file,
+                                    bucket=self.config.bucket,
+                                    s3_key=s3_scaling_params_key)
+        self.s3_handler.safe_upload(local_path=metadata_file,
+                                    bucket=self.config.bucket,
+                                    s3_key=s3_metadata_key)
+
         # Save scaled training data
         train_file = self.output_dir / f"{country_code}_train.csv"
         scaled_data.to_csv(train_file, index=False)
@@ -78,9 +114,14 @@ class CashForecastingPipeline:
         self.logger.info(f"Saved scaled training data to {train_file}")
 
         # Create and save inference template
+        # NOTE: This template only includes combinations from the training dataset.
+        # Therefore, no unseen (Currency, BranchId) combinations should appear here.
+        # If the inference script introduces new combinations, that must be addressed
+        # there (e.g., filter them out or retrain with these combinations included).
         inference_template = data.drop_duplicates(
             subset=['ProductId', 'BranchId', 'Currency']
         )[['ProductId', 'BranchId', 'Currency']]
+
         inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
         inference_template.to_csv(inference_template_file, index=False)
         self.logger.info(f"Saved inference template to {inference_template_file}")
@@ -100,7 +141,7 @@ class CashForecastingPipeline:
         self.logger.info(f"Starting model training for {country_code}")
         job_name = f"{country_code}-ts-{self.timestamp}"
 
-        # Configure AutoML job
+        # Configure AutoML job (no CategoricalFeatures since not supported)
         automl_config = {
             'AutoMLJobName': job_name,
             'AutoMLJobInputDataConfig': [{
@@ -126,8 +167,7 @@ class CashForecastingPipeline:
                         'TargetAttributeName': 'Demand',
                         'TimestampAttributeName': 'EffectiveDate',
                         'ItemIdentifierAttributeName': 'ProductId',
-                        'GroupingAttributeNames': ['BranchId', 'Currency'],
-                        'CategoricalFeatures': ['ProductId', 'BranchId', 'Currency']
+                        'GroupingAttributeNames': ['BranchId', 'Currency']
                     }
 
                 }
@@ -211,7 +251,6 @@ class CashForecastingPipeline:
             raise
 
         return model_name
-
 
     def _run_batch_transform_job(self, country_code: str, model_name: str, s3_inference_data_uri: str,
                                  batch_number: int) -> None:
@@ -334,7 +373,7 @@ def main():
         config = load_config(args.config)
         logger.info("Configuration loaded successfully.")
 
-        # Initialize and run the pipeline (assuming CashForecastingPipeline class exists)
+        # Initialize and run the pipeline
         pipeline = CashForecastingPipeline(config=config, logger=logger)
         pipeline.run_pipeline(
             country_code=args.countries[0],
@@ -348,7 +387,6 @@ def main():
         logger.error(f"Pipeline failed: {e}", exc_info=True)
         sys.exit(1)
 
+
 if __name__ == "__main__":
     main()
-
-
