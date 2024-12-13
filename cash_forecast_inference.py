@@ -1,5 +1,3 @@
-# cash_forecast_inference.py
-
 """
 Cash Forecasting Inference Script
 
@@ -7,10 +5,17 @@ This script performs inference using a trained forecasting model on new data.
 It leverages shared utilities from common.py for configuration management,
 data processing, logging, and AWS interactions.
 
-python cs_scripts/cash_forecast_inference.py   --config cs_scripts/config.yaml   --countries ZM   --model_timestamp 20241209-035546   --effective_date 2024-12-09   --model_name ZM-model-20241209-035546   --inference_template ./cs_data/cash/ZM_20241209-035546/ZM_inference_template.csv
+Usage:
+python cs_scripts/cash_forecast_inference.py \
+    --config cs_scripts/config.yaml \
+    --countries ZM \
+    --model_timestamp 20241209-035546 \
+    --effective_date 2024-12-09 \
+    --model_name ZM-model-20241209-035546 \
+    --inference_template ./cs_data/cash/ZM_20241209-035546/ZM_inference_template.csv
 """
 
-import shutil  # Add this import at the top of the script
+import shutil
 import sys
 from pathlib import Path
 from time import gmtime, strftime, sleep
@@ -31,7 +36,7 @@ from common import (
     load_config,
     parse_arguments
 )
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any, Optional
 import json
 
 
@@ -124,8 +129,7 @@ class CashForecastingPipeline:
 
             # Generate future dates based on effective_date and forecast_horizon
             effective_date_dt = pd.to_datetime(effective_date)
-            future_dates = [effective_date_dt + pd.Timedelta(days=i) for i in
-                            range(1, self.config.forecast_horizon + 1)]
+            future_dates = [effective_date_dt + pd.Timedelta(days=i) for i in range(1, self.config.forecast_horizon + 1)]
 
             # Create the inference DataFrame using the entire template
             inference_data = pd.DataFrame({
@@ -227,9 +231,11 @@ class CashForecastingPipeline:
         """
         Monitor the SageMaker transform job until completion.
 
-        Exits cleanly when job completes, fails, or stops. If an exception occurs
-        while describing the job, it logs and re-raises to halt execution and avoid
-        an infinite loop.
+        Args:
+            transform_job_name (str): The name of the transform job.
+
+        Raises:
+            RuntimeError: If the transform job fails.
         """
         self.logger.info(f"Monitoring transform job: {transform_job_name}")
         sleep_time = 30  # Start with 30 seconds
@@ -244,21 +250,16 @@ class CashForecastingPipeline:
                     if status != 'Completed':
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
-                        # Raise an error to exit the function and stop further monitoring
                         raise RuntimeError(
-                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}"
-                        )
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
                     self.logger.info(f"Transform job {transform_job_name} completed successfully.")
                     break
 
-                # If the job is still in progress, wait and try again
                 sleep(sleep_time)
                 sleep_time = min(sleep_time * 1.5, 600)  # Exponential backoff up to 10 minutes
-
             except Exception as e:
-                # Log the error and re-raise it to prevent infinite looping
-                self.logger.error(f"Error monitoring transform job {transform_job_name}: {e}", exc_info=True)
-                raise
+                self.logger.error(f"Error monitoring transform job {transform_job_name}: {e}")
+                sleep(60)  # Wait before retrying
 
     def download_forecast_results(self, country_code: str) -> pd.DataFrame:
         """
@@ -268,7 +269,7 @@ class CashForecastingPipeline:
             country_code (str): The country code.
 
         Returns:
-            pd.DataFrame: Combined forecast DataFrame.
+            pd.DataFrame: Combined forecast DataFrame containing p10, p50, p90.
 
         Raises:
             FileNotFoundError: If no forecast results are found.
@@ -296,21 +297,57 @@ class CashForecastingPipeline:
                 self.s3_handler.download_file(bucket=self.config.bucket, s3_key=key, local_path=local_file)
                 self.logger.info(f"Downloaded forecast file {key} to {local_file}")
 
-                # Read forecast data (assuming CSV format without headers)
-                df = pd.read_csv(local_file, header=None)
+                # Read forecast data, skipping the first two rows (headers and metadata)
+                # Adjust 'sep' if your CSV uses a different delimiter
+                df = pd.read_csv(local_file, header=None, skiprows=2, sep=',')  # Change sep if needed
+
+                # Debugging: Log the DataFrame shape and first few rows
+                self.logger.debug(f"Forecast DataFrame shape after reading CSV: {df.shape}")
+                self.logger.debug(f"Forecast DataFrame columns before assignment: {df.columns.tolist()}")
+                self.logger.debug(f"Forecast DataFrame head:\n{df.head()}")
+
+                # Assign meaningful column names based on known structure
+                # Ensure the number of column names matches the actual number of columns in df
+                expected_columns = {
+                    8: [
+                        'Currency', 'BranchId', 'ProductId', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean'
+                    ],
+                    10: [
+                        'Currency', 'BranchId', 'ProductId', 'BranchId_dup',
+                        'Currency_dup', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean'
+                    ]
+                }
+
                 num_columns = len(df.columns)
-                self.logger.info(f"Forecast file {key} has {num_columns} columns.")
-
-                # Assign quantile columns based on config.quantiles
-                if num_columns != len(self.config.quantiles):
-                    self.logger.warning(f"Expected {len(self.config.quantiles)} quantiles, but got {num_columns} in file {key}")
-                    # Adjust column names accordingly
-                    df.columns = [f"Quantile_{i+1}" for i in range(num_columns)]
+                if num_columns in expected_columns:
+                    df.columns = expected_columns[num_columns]
+                    self.logger.debug(f"Assigned column names: {df.columns.tolist()}")
                 else:
-                    df.columns = self.config.quantiles
+                    self.logger.error(
+                        f"Unexpected number of columns ({num_columns}) in forecast file {key}. Expected {list(expected_columns.keys())}."
+                    )
+                    raise ValueError(
+                        f"Unexpected number of columns ({num_columns}) in forecast file {key}. Expected {list(expected_columns.keys())}."
+                    )
 
-                forecast_dfs.append(df)
-                self.logger.info(f"Processed forecast file {key} with shape {df.shape}")
+                # Extract only the quantile columns
+                quantile_columns = ['p10', 'p50', 'p90']
+                missing_quantiles = [q for q in quantile_columns if q not in df.columns]
+                if missing_quantiles:
+                    self.logger.warning(f"Missing quantiles {missing_quantiles} in forecast file {key}")
+                    # Decide whether to skip, fill with NaN, or handle differently
+
+                df_quantiles = df[quantile_columns].copy()
+
+                # Replace 'ERROR' strings with NaN
+                df_quantiles.replace('ERROR', np.nan, inplace=True)
+
+                # Convert quantile columns to numeric, coercing errors to NaN
+                for q in quantile_columns:
+                    df_quantiles[q] = pd.to_numeric(df_quantiles[q], errors='coerce')
+
+                forecast_dfs.append(df_quantiles)
+                self.logger.info(f"Processed forecast file {key} with shape {df_quantiles.shape}")
 
             # Combine all forecast DataFrames
             combined_forecast = pd.concat(forecast_dfs, ignore_index=True)
@@ -324,15 +361,15 @@ class CashForecastingPipeline:
 
         finally:
             # Clean up temporary directory
-            shutil.rmtree(temp_dir)
+            shutil.rmtree(temp_dir, ignore_errors=True)
             self.logger.info(f"Cleaned up temporary forecast downloads at {temp_dir}")
 
-    def restore_forecasts_scale(self, forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:  # CHANGED
+    def restore_forecasts_scale(self, forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:
         """
         Restore the original scale of the forecasted Demand values.
 
         Args:
-            forecast_df (pd.DataFrame): DataFrame containing forecasted quantiles.
+            forecast_df (pd.DataFrame): DataFrame containing forecasted quantiles (p10, p50, p90).
             country_code (str): The country code.
 
         Returns:
@@ -340,33 +377,53 @@ class CashForecastingPipeline:
         """
         self.logger.info("Restoring original scale to forecasted Demand values.")
         try:
-            # Use country_code now that it's passed as a parameter
+            # Load the inference data
             inference_csv = self.output_dir / f"{country_code}_inference_{self.timestamp}.csv"
             inference_data = self.data_processor.load_data(str(inference_csv))
 
-            # Attempt to align forecast data with inference data
+            # Check for data length mismatch
             if len(forecast_df) != len(inference_data):
                 self.logger.warning(
-                    f"Forecast data length {len(forecast_df)} does not match inference data length {len(inference_data)}")
-                # The code can be extended here if alignment logic is needed.
+                    f"Forecast data length {len(forecast_df)} does not match inference data length {len(inference_data)}"
+                )
+                # Align the forecast data to match inference data length
+                if len(forecast_df) > len(inference_data):
+                    self.logger.warning("Forecast data has extra rows. Dropping the extra rows.")
+                    forecast_df = forecast_df.iloc[:len(inference_data)]
+                else:
+                    self.logger.warning("Forecast data has fewer rows. Filling the missing rows with NaN.")
+                    missing_rows = len(inference_data) - len(forecast_df)
+                    additional_df = pd.DataFrame({
+                        'p10': [np.nan] * missing_rows,
+                        'p50': [np.nan] * missing_rows,
+                        'p90': [np.nan] * missing_rows
+                    })
+                    forecast_df = pd.concat([forecast_df, additional_df], ignore_index=True)
 
-            # Re-attach Currency, BranchId columns
-            # Assuming forecast_df rows correspond 1:1 with inference_data rows after sorting:
-            forecast_df = inference_data[['Currency', 'BranchId']].reset_index(drop=True).join(forecast_df)
+            # Re-attach necessary columns: ProductId and ForecastDate
+            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency', 'ForecastDate']].reset_index(drop=True).join(forecast_df)
 
             # Restore scaling for each group
             for (currency, branch), params in self.scaling_params.items():
                 mask = (forecast_df['Currency'] == currency) & (forecast_df['BranchId'] == branch)
                 for quantile in self.config.quantiles:
                     if quantile in forecast_df.columns:
-                        forecast_df.loc[mask, quantile] = (
-                                (forecast_df.loc[mask, quantile] * (params['std'] if params['std'] != 0 else 1)) +
-                                params['mean']
-                        )
-                        self.logger.info(f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}")
+                        # Check if scaling parameters exist
+                        if (currency, branch) in self.scaling_params:
+                            mean = self.scaling_params[(currency, branch)]['mean']
+                            std = self.scaling_params[(currency, branch)]['std'] if self.scaling_params[(currency, branch)]['std'] != 0 else 1
+                            forecast_df.loc[mask, quantile] = (
+                                (forecast_df.loc[mask, quantile] * std) + mean
+                            )
+                            self.logger.info(f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}")
+                        else:
+                            self.logger.warning(
+                                f"Scaling parameters not found for Currency={currency}, Branch={branch}. Skipping scaling."
+                            )
                     else:
                         self.logger.warning(
-                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}")
+                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}"
+                        )
 
             self.logger.info("Scale restoration completed successfully.")
             return forecast_df
@@ -374,6 +431,29 @@ class CashForecastingPipeline:
         except Exception as e:
             self.logger.error(f"Failed to restore forecast scales: {e}")
             raise
+
+    def validate_forecast_data(self, forecast_df: pd.DataFrame) -> None:
+        """
+        Validate the forecast DataFrame for required columns and data types.
+
+        Args:
+            forecast_df (pd.DataFrame): DataFrame containing forecasted quantiles.
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        required_columns = ['ProductId', 'BranchId', 'Currency', 'ForecastDate', 'p10', 'p50', 'p90']
+        missing_columns = set(required_columns) - set(forecast_df.columns)
+        if missing_columns:
+            raise ValueError(f"Missing required columns in forecast data: {missing_columns}")
+
+        # Additional type checks can be added here
+        if not pd.api.types.is_numeric_dtype(forecast_df['p10']):
+            raise TypeError("Quantile 'p10' must be numeric.")
+        if not pd.api.types.is_numeric_dtype(forecast_df['p50']):
+            raise TypeError("Quantile 'p50' must be numeric.")
+        if not pd.api.types.is_numeric_dtype(forecast_df['p90']):
+            raise TypeError("Quantile 'p90' must be numeric.")
 
     def save_final_forecasts(self, forecast_df: pd.DataFrame, country_code: str) -> None:
         """
@@ -387,6 +467,9 @@ class CashForecastingPipeline:
             Exception: If saving fails.
         """
         try:
+            # Optionally, rename 'p50' to 'Demand' if required
+            forecast_df = forecast_df.rename(columns={'p50': 'Demand'})
+
             final_forecast_path = self.output_dir / f"{country_code}_final_forecast_{self.timestamp}.csv"
             forecast_df.to_csv(final_forecast_path, index=False)
             self.logger.info(f"Final forecasts saved to {final_forecast_path}")
@@ -462,11 +545,10 @@ class CashForecastingPipeline:
             forecast_df = self.download_forecast_results(country_code)
 
             # Restore original scale
-            # Previously:
-            # restored_forecast_df = self.restore_forecasts_scale(forecast_df)
+            restored_forecast_df = self.restore_forecasts_scale(forecast_df, country_code)
 
-            # Now:
-            restored_forecast_df = self.restore_forecasts_scale(forecast_df, country_code)  # CHANGED
+            # Validate forecast data
+            self.validate_forecast_data(restored_forecast_df)
 
             # Save final forecasts
             self.save_final_forecasts(restored_forecast_df, country_code)
@@ -484,7 +566,6 @@ class CashForecastingPipeline:
 
 def main():
     """Main entry point for the cash forecasting inference script."""
-    # Parse command line arguments using common.py's parse_arguments()
     # Parse command line arguments using common.py's parse_arguments() with inference=True
     args = parse_arguments(inference=True)
 
