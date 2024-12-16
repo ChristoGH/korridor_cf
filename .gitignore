@@ -1,0 +1,38 @@
+# System files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+
+# Python-specific files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.log
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+
+# Output and data directories
+data/
+output/
+forecast_visualizations_*/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Diff or debugging output
+diff_output.txt
+
+# Documentation drafts
+*.md.md
+

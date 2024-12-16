@@ -81,7 +81,7 @@ class CashForecastingPipeline:
         data = self.data_processor.load_data(input_file)
 
         # Prepare and scale data
-        scaled_data, scaling_params = self.data_processor.prepare_data(data)
+        scaled_data, scaling_params = self.data_processor.prepare_data(data, country_code)
 
         # Create directories for output
         self.output_dir = Path(f"./cs_data/cash/{country_code}_{self.timestamp}")
@@ -101,11 +101,11 @@ class CashForecastingPipeline:
         s3_metadata_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/{country_code}_scaling_metadata.json"
 
         self.s3_handler.safe_upload(local_path=scaling_file,
-                                    bucket=self.config.bucket,
-                                    s3_key=s3_scaling_params_key)
+                                     bucket=self.config.bucket,
+                                     s3_key=s3_scaling_params_key)
         self.s3_handler.safe_upload(local_path=metadata_file,
-                                    bucket=self.config.bucket,
-                                    s3_key=s3_metadata_key)
+                                     bucket=self.config.bucket,
+                                     s3_key=s3_metadata_key)
 
         # Save scaled training data
         train_file = self.output_dir / f"{country_code}_train.csv"
@@ -114,10 +114,6 @@ class CashForecastingPipeline:
         self.logger.info(f"Saved scaled training data to {train_file}")
 
         # Create and save inference template
-        # NOTE: This template only includes combinations from the training dataset.
-        # Therefore, no unseen (Currency, BranchId) combinations should appear here.
-        # If the inference script introduces new combinations, that must be addressed
-        # there (e.g., filter them out or retrain with these combinations included).
         inference_template = data.drop_duplicates(
             subset=['ProductId', 'BranchId', 'Currency']
         )[['ProductId', 'BranchId', 'Currency']]
@@ -358,7 +354,6 @@ class CashForecastingPipeline:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}")
             raise
 
-
 def main():
     # Parse command line arguments without inference-specific arguments
     args = parse_arguments()  # inference=False by default
@@ -386,7 +381,6 @@ def main():
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

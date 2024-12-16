@@ -6,13 +6,15 @@ It leverages shared utilities from common.py for configuration management,
 data processing, logging, and AWS interactions.
 
 Usage:
+
+ZM-model-20241213-144156
 python cs_scripts/cash_forecast_inference.py \
     --config cs_scripts/config.yaml \
     --countries ZM \
-    --model_timestamp 20241209-035546 \
+    --model_timestamp 20241213-144156 \
     --effective_date 2024-12-09 \
-    --model_name ZM-model-20241209-035546 \
-    --inference_template ./cs_data/cash/ZM_20241209-035546/ZM_inference_template.csv
+    --model_name ZM-model-20241213-144156 \
+    --inference_template ./cs_data/cash/ZM_20241213-144156/ZM_inference_template.csv
 """
 
 import shutil
@@ -96,64 +98,36 @@ class CashForecastingPipeline:
 
         self.logger.info(f"Scaling parameters and metadata loaded and validated for {country_code}")
 
-    def prepare_inference_data(self, country_code: str, effective_date: str, inference_template_path: str) -> str:
-        """
-        Prepare the inference data based on the provided template and effective date.
-        """
-        self.logger.info(f"Preparing inference data for country: {country_code}")
-        try:
-            # Load the inference template
-            inference_template_df = self.data_processor.load_data(inference_template_path)
-            # Ensure the inference template is not empty
-            if inference_template_df.empty:
-                raise ValueError("Inference template is empty. No combinations available from the training data.")
+    def prepare_inference_data(self, country_code, effective_date, inference_template_path):
+        # Load inference data
+        inference_df = pd.read_csv(inference_template_path)
+        self.logger.info(f"Loaded data with shape {inference_df.shape}")
 
-            # Log the number of combinations to be used
-            num_combinations = len(inference_template_df)
-            self.logger.info(f"Number of valid combinations for inference: {num_combinations}")
+        # **No need to filter 'IsValid' as the inference template excludes invalid entries**
 
-            # Validate that all combinations in the template have scaling parameters
-            valid_combinations = set(self.scaling_params.keys())
-            self.logger.debug(f"Valid combinations: {valid_combinations}")
-            inference_template_df['IsValid'] = inference_template_df.apply(
-                lambda row: (row['Currency'], str(row['BranchId'])) in valid_combinations, axis=1
-            )
-            invalid_combinations = inference_template_df[~inference_template_df['IsValid']]
-            if not invalid_combinations.empty:
-                self.logger.error(f"Missing scaling parameters for combinations:\n{invalid_combinations}")
-                raise ValueError(f"Missing scaling parameters for some combinations in the inference template.")
+        # **Create scaling keys based only on Currency and BranchId**
+        inference_df['ScalingKey'] = inference_df['Currency'] + '_' + inference_df['BranchId'].astype(str)
 
-            # Proceed with valid combinations only
-            inference_template_df = inference_template_df[inference_template_df['IsValid']].drop(columns=['IsValid'])
-            self.logger.info(f"Filtered inference template to {len(inference_template_df)} valid combinations.")
+        # Map scaling parameters
+        scaling_means = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('mean'))
+        scaling_stds = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('std'))
 
-            # Generate future dates based on effective_date and forecast_horizon
-            effective_date_dt = pd.to_datetime(effective_date)
-            future_dates = [effective_date_dt + pd.Timedelta(days=i) for i in range(1, self.config.forecast_horizon + 1)]
+        # Identify missing scaling parameters
+        missing = inference_df[scaling_means.isnull() | scaling_stds.isnull()]
+        if not missing.empty:
+            self.logger.error(
+                f"Missing scaling parameters for combinations:\n{missing[['ProductId', 'BranchId', 'Currency']]}")
+            raise ValueError("Missing scaling parameters for some combinations in the inference template.")
 
-            # Create the inference DataFrame using the entire template
-            inference_data = pd.DataFrame({
-                'ProductId': np.tile(inference_template_df['ProductId'].values, self.config.forecast_horizon),
-                'BranchId': np.tile(inference_template_df['BranchId'].values, self.config.forecast_horizon),
-                'Currency': np.tile(inference_template_df['Currency'].values, self.config.forecast_horizon),
-                'EffectiveDate': effective_date_dt,
-                'ForecastDate': np.repeat(future_dates, len(inference_template_df)),
-                'Demand': np.nan  # Placeholder for unknown demand
-            })
-            self.logger.info(f"Inference data generated with shape {inference_data.shape}")
+        # Apply scaling
+        inference_df['Demand_scaled'] = (inference_df['Demand'] - scaling_means) / scaling_stds
 
-            # Save inference data to CSV
-            self.output_dir = Path(f"./inference_results/{country_code}_{self.timestamp}")
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            inference_file = self.output_dir / f"{country_code}_inference_{self.timestamp}.csv"
-            inference_data.to_csv(inference_file, index=False)
-            self.logger.info(f"Inference data saved to {inference_file}")
+        # Save or return the scaled data
+        scaled_inference_file = f"scaled_inference_{country_code}.csv"
+        inference_df.to_csv(scaled_inference_file, index=False)
+        self.logger.info(f"Scaled inference data saved to {scaled_inference_file}")
 
-            return str(inference_file)
-
-        except Exception as e:
-            self.logger.error(f"Failed to prepare inference data: {e}")
-            raise
+        return scaled_inference_file
 
     def upload_inference_data(self, inference_file: str, country_code: str) -> str:
         """
@@ -367,13 +341,6 @@ class CashForecastingPipeline:
     def restore_forecasts_scale(self, forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:
         """
         Restore the original scale of the forecasted Demand values.
-
-        Args:
-            forecast_df (pd.DataFrame): DataFrame containing forecasted quantiles (p10, p50, p90).
-            country_code (str): The country code.
-
-        Returns:
-            pd.DataFrame: DataFrame with restored Demand values.
         """
         self.logger.info("Restoring original scale to forecasted Demand values.")
         try:
@@ -401,29 +368,26 @@ class CashForecastingPipeline:
                     forecast_df = pd.concat([forecast_df, additional_df], ignore_index=True)
 
             # Re-attach necessary columns: ProductId and ForecastDate
-            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency', 'ForecastDate']].reset_index(drop=True).join(forecast_df)
+            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency', 'ForecastDate']].reset_index(
+                drop=True).join(forecast_df)
 
-            # Restore scaling for each group
-            for (currency, branch), params in self.scaling_params.items():
-                mask = (forecast_df['Currency'] == currency) & (forecast_df['BranchId'] == branch)
-                for quantile in self.config.quantiles:
-                    if quantile in forecast_df.columns:
-                        # Check if scaling parameters exist
-                        if (currency, branch) in self.scaling_params:
-                            mean = self.scaling_params[(currency, branch)]['mean']
-                            std = self.scaling_params[(currency, branch)]['std'] if self.scaling_params[(currency, branch)]['std'] != 0 else 1
-                            forecast_df.loc[mask, quantile] = (
-                                (forecast_df.loc[mask, quantile] * std) + mean
-                            )
-                            self.logger.info(f"Inverse scaled {quantile} for Currency={currency}, Branch={branch}")
-                        else:
-                            self.logger.warning(
-                                f"Scaling parameters not found for Currency={currency}, Branch={branch}. Skipping scaling."
-                            )
-                    else:
-                        self.logger.warning(
-                            f"Quantile '{quantile}' not found in forecast data for Currency={currency}, Branch={branch}"
-                        )
+            # Create scaling_key column
+            forecast_df['scaling_key'] = forecast_df.apply(lambda row: f"{row['Currency']}_{row['BranchId']}", axis=1)
+
+            # Map scaling parameters to each row
+            forecast_df['mean'] = forecast_df['scaling_key'].map(
+                lambda x: self.scaling_params[x]['mean'] if x in self.scaling_params else np.nan)
+            forecast_df['std'] = forecast_df['scaling_key'].map(
+                lambda x: self.scaling_params[x]['std'] if x in self.scaling_params else 1)
+
+            # Apply inverse scaling
+            for quantile in self.config.quantiles:
+                if quantile in forecast_df.columns:
+                    forecast_df[quantile] = forecast_df[quantile] * forecast_df['std'] + forecast_df['mean']
+                    self.logger.debug(f"Inverse scaled quantile '{quantile}'")
+
+            # Drop auxiliary columns
+            forecast_df.drop(['scaling_key', 'mean', 'std'], axis=1, inplace=True)
 
             self.logger.info("Scale restoration completed successfully.")
             return forecast_df
