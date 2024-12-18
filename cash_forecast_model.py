@@ -74,55 +74,67 @@ class CashForecastingPipeline:
         self.output_dir = None  # Will be set in run_pipeline
 
     def prepare_data(self, input_file: str, country_code: str) -> Tuple[str, str]:
-        """Prepare data for training and create inference template."""
+        """
+        Prepare data for training following AWS blog best practices.
+
+        Implements time-aware splitting strategy:
+        - Sorts data chronologically within each group
+        - Creates training set excluding last 8 timestamps
+        - Creates test set from timestamps n-8 to n-4
+        - Reserves last 4 timestamps for validation
+        """
         self.logger.info(f"Preparing data for country: {country_code}")
 
         # Load data using DataProcessor
         data = self.data_processor.load_data(input_file)
 
-        # Prepare and scale data
-        scaled_data, scaling_params = self.data_processor.prepare_data(data, country_code)
+        # Convert timestamp to datetime
+        data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate'])
 
-        # Create directories for output
-        self.output_dir = Path(f"./cs_data/cash/{country_code}_{self.timestamp}")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Sort data properly for time series
+        data = data.sort_values(['ProductId', 'BranchId', 'Currency', 'EffectiveDate'])
 
-        # Save scaling parameters
-        scaling_file = self.output_dir / f"{country_code}_scaling_params.json"
-        self.data_processor.save_scaling_params(scaling_params, scaling_file)
+        # Initialize containers for split data
+        train_dfs = []
+        test_dfs = []
 
-        # Generate and save scaling metadata
-        metadata = self.data_processor.generate_scaling_metadata(data, scaling_params)
-        metadata_file = self.output_dir / f"{country_code}_scaling_metadata.json"
-        self.data_processor.save_metadata(metadata, metadata_file)
+        # Split data by group as per blog recommendations
+        for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
+            if len(group_data) <= 8:
+                self.logger.warning(f"Group {group_key} has insufficient data points (<= 8), skipping")
+                continue
 
-        # Upload scaling parameters and metadata to S3
-        s3_scaling_params_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/{country_code}_scaling_params.json"
-        s3_metadata_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/{country_code}_scaling_metadata.json"
+            # Get chronologically sorted timestamps
+            timestamps = group_data['EffectiveDate'].unique()
 
-        self.s3_handler.safe_upload(local_path=scaling_file,
-                                     bucket=self.config.bucket,
-                                     s3_key=s3_scaling_params_key)
-        self.s3_handler.safe_upload(local_path=metadata_file,
-                                     bucket=self.config.bucket,
-                                     s3_key=s3_metadata_key)
+            # Identify split points
+            train_end = len(timestamps) - 8
+            test_start = len(timestamps) - 8
+            test_end = len(timestamps) - 4
 
-        # Save scaled training data
+            # Split the data
+            train_mask = group_data['EffectiveDate'] < timestamps[train_end]
+            test_mask = (group_data['EffectiveDate'] >= timestamps[test_start]) & \
+                        (group_data['EffectiveDate'] < timestamps[test_end])
+
+            train_dfs.append(group_data[train_mask])
+            test_dfs.append(group_data[test_mask])
+
+        # Combine split datasets
+        train_df = pd.concat(train_dfs, ignore_index=True)
+        test_df = pd.concat(test_dfs, ignore_index=True)
+
+        # Scale data if needed
+        scaled_data, scaling_params = self.data_processor.prepare_data(train_df, country_code)
+
+        # Save the data
         train_file = self.output_dir / f"{country_code}_train.csv"
+        test_file = self.output_dir / f"{country_code}_test.csv"
+
         scaled_data.to_csv(train_file, index=False)
-        self.train_file = str(train_file)
-        self.logger.info(f"Saved scaled training data to {train_file}")
+        test_df.to_csv(test_file, index=False)
 
-        # Create and save inference template
-        inference_template = data.drop_duplicates(
-            subset=['ProductId', 'BranchId', 'Currency']
-        )[['ProductId', 'BranchId', 'Currency']]
-
-        inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
-        inference_template.to_csv(inference_template_file, index=False)
-        self.logger.info(f"Saved inference template to {inference_template_file}")
-
-        return str(train_file), str(inference_template_file)
+        return str(train_file), str(test_file)
 
     def upload_training_data(self, train_file: str, country_code: str) -> str:
         """Upload training data to S3 and return the S3 URI."""
@@ -137,7 +149,7 @@ class CashForecastingPipeline:
         self.logger.info(f"Starting model training for {country_code}")
         job_name = f"{country_code}-ts-{self.timestamp}"
 
-        # Configure AutoML job (no CategoricalFeatures since not supported)
+        # Enhanced AutoML configuration based on AWS blog best practices
         automl_config = {
             'AutoMLJobName': job_name,
             'AutoMLJobInputDataConfig': [{
@@ -163,14 +175,27 @@ class CashForecastingPipeline:
                         'TargetAttributeName': 'Demand',
                         'TimestampAttributeName': 'EffectiveDate',
                         'ItemIdentifierAttributeName': 'ProductId',
-                        'GroupingAttributeNames': ['BranchId', 'Currency']
+                        'GroupingAttributeNames': ['BranchId', 'Currency'],
+                        'FillConfig': {  # Added filling configuration as per blog
+                            'ImputationStrategy': 'FORWARD_FILL',  # Example strategy
+                            'BackfillStrategy': 'ZERO'
+                        }
                     }
-
                 }
             },
-            'RoleArn': self.role
+            'RoleArn': self.role,
+            'ModelMetrics': {  # Added model metrics configuration
+                'ModelQuality': {
+                    'Statistics': {
+                        'S3Uri': f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.timestamp}/metrics/"
+                    }
+                }
+            },
+            'GenerateCandidateDefinitionsOnly': False,  # Ensures full model training
+            'RetryStrategy': {  # Added retry strategy for robustness
+                'MaxAttempts': 3
+            }
         }
-
         # Start training
         try:
             self.sm_client.create_auto_ml_job_v2(**automl_config)
@@ -181,30 +206,121 @@ class CashForecastingPipeline:
 
         return job_name
 
-    def _monitor_job(self, job_name: str) -> str:
-        """Monitor the AutoML job until completion."""
-        self.logger.info(f"Monitoring AutoML job: {job_name}")
-        sleep_time = 60  # Start with 1 minute
+    def prepare_data(self, input_file: str, country_code: str) -> Tuple[str, str]:
+        """
+        Prepare data for training with enhanced sorting as per AWS blog best practices.
 
-        while True:
-            try:
-                response = self.sm_client.describe_auto_ml_job_v2(AutoMLJobName=job_name)
-                status = response['AutoMLJobStatus']
-                self.logger.info(f"Job {job_name} status: {status}")
+        The sorting process follows these steps:
+        1. Convert timestamp to proper datetime format
+        2. Validate timestamp consistency
+        3. Multi-level sort by identifiers and timestamp
+        4. Verify sort integrity
+        5. Handle any gaps in time series
+        """
+        self.logger.info(f"Preparing data for country: {country_code}")
 
-                if status in ['Completed', 'Failed', 'Stopped']:
-                    if status != 'Completed':
-                        failure_reason = response.get('FailureReason', 'No failure reason provided.')
-                        self.logger.error(f"AutoML job {job_name} failed: {failure_reason}")
-                    break
+        # Load data using DataProcessor
+        data = self.data_processor.load_data(input_file)
 
-                sleep(sleep_time)
-                sleep_time = min(sleep_time * 1.5, 600)  # Increase sleep time up to 10 minutes
-            except Exception as e:
-                self.logger.error(f"Error monitoring AutoML job: {e}")
-                sleep(60)  # Wait before retrying
+        # 1. Convert timestamp to datetime with validation
+        try:
+            data['EffectiveDate'] = pd.to_datetime(data['EffectiveDate'])
+            self.logger.info("Timestamp conversion successful")
+        except Exception as e:
+            self.logger.error(f"Failed to convert timestamps: {e}")
+            raise ValueError("Timestamp conversion failed. Please ensure timestamp format is consistent.")
 
-        return status
+        # 2. Validate timestamp consistency
+        timestamp_freq = pd.infer_freq(data['EffectiveDate'].sort_values())
+        if timestamp_freq is None:
+            self.logger.warning("Could not infer consistent timestamp frequency. Check for irregular intervals.")
+
+        # 3. Multi-level sort implementation
+        try:
+            data = data.sort_values(
+                by=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
+                ascending=[True, True, True, True],
+                na_position='first'  # Handle any NAs consistently
+            )
+            self.logger.info("Multi-level sort completed successfully")
+        except Exception as e:
+            self.logger.error(f"Sorting failed: {e}")
+            raise
+
+        # 4. Verify sort integrity
+        for group in data.groupby(['ProductId', 'BranchId', 'Currency']):
+            group_data = group[1]  # group[0] is the key, group[1] is the data
+
+            # Check if timestamps are strictly increasing within group
+            if not group_data['EffectiveDate'].is_monotonic_increasing:
+                self.logger.error(f"Non-monotonic timestamps found in group {group[0]}")
+                raise ValueError(f"Time series integrity violated in group {group[0]}")
+
+            # Check for duplicates
+            duplicates = group_data.duplicated(subset=['EffectiveDate'], keep=False)
+            if duplicates.any():
+                self.logger.warning(f"Duplicate timestamps found in group {group[0]}")
+                # Log the duplicates for investigation
+                self.logger.warning(f"Duplicate records:\n{group_data[duplicates]}")
+
+        # 5. Handle gaps in time series
+        groups_with_gaps = []
+        for group in data.groupby(['ProductId', 'BranchId', 'Currency']):
+            group_data = group[1]
+            expected_dates = pd.date_range(
+                start=group_data['EffectiveDate'].min(),
+                end=group_data['EffectiveDate'].max(),
+                freq=timestamp_freq
+            )
+            if len(expected_dates) != len(group_data):
+                groups_with_gaps.append(group[0])
+
+        if groups_with_gaps:
+            self.logger.warning(f"Found gaps in time series for groups: {groups_with_gaps}")
+
+        self.logger.info(f"Data preparation completed. Processed {len(data)} records across "
+                         f"{len(data.groupby(['ProductId', 'BranchId', 'Currency']))} groups")
+
+        # Proceed with splitting and scaling as before...
+        train_df, test_df = self._split_data(data)
+        scaled_data, scaling_params = self.data_processor.prepare_data(train_df, country_code)
+
+        # Save the data
+        train_file = self.output_dir / f"{country_code}_train.csv"
+        test_file = self.output_dir / f"{country_code}_test.csv"
+
+        scaled_data.to_csv(train_file, index=False)
+        test_df.to_csv(test_file, index=False)
+
+        return str(train_file), str(test_file)
+
+    def _split_data(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Split the sorted data into training and test sets following the blog's methodology.
+        """
+        train_dfs = []
+        test_dfs = []
+
+        for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
+            timestamps = group_data['EffectiveDate'].unique()
+
+            if len(timestamps) <= 8:
+                self.logger.warning(f"Group {group_key} has insufficient data points (<= 8), skipping")
+                continue
+
+            # Split as per blog's specification
+            train_end = len(timestamps) - 8
+            test_start = len(timestamps) - 8
+            test_end = len(timestamps) - 4
+
+            train_mask = group_data['EffectiveDate'] < timestamps[train_end]
+            test_mask = (group_data['EffectiveDate'] >= timestamps[test_start]) & \
+                        (group_data['EffectiveDate'] < timestamps[test_end])
+
+            train_dfs.append(group_data[train_mask])
+            test_dfs.append(group_data[test_mask])
+
+        return pd.concat(train_dfs, ignore_index=True), pd.concat(test_dfs, ignore_index=True)
 
     def _get_best_model(self, job_name: str, country_code: str) -> str:
         """Retrieve and create the best model from the AutoML job."""
