@@ -15,6 +15,7 @@ from time import sleep
 import argparse
 import sys
 from pathlib import Path
+import json
 from time import gmtime, strftime
 import logging
 import boto3
@@ -34,10 +35,7 @@ from common import (
 
 
 class CashForecastingPipeline:
-    """Pipeline for training and forecasting cash demand models."""
-
     def __init__(self, config: Config, logger: logging.Logger):
-        """Initialize the forecasting pipeline with configuration."""
         self.config = config
         self.logger = logger
         self.session = Session()
@@ -46,32 +44,14 @@ class CashForecastingPipeline:
         self.data_processor = DataProcessor(logger=self.logger)
         self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
         self.role = self.config.role_arn
-        self.train_file: Optional[str] = None
-        self.output_dir: Optional[Path] = None  # Will be set in run_pipeline
-        self.scaling_params: Optional[Dict[str, Dict[str, float]]] = None
-        self.scaling_metadata: Optional[Dict[str, Any]] = None
-        # After determining self.output_dir = Path(f"./output/{country_code}/{self.timestamp}")
-        self.scaling_dir = self.output_dir / 'scaling'
-        self.scaling_dir.mkdir(parents=True, exist_ok=True)
-        self.training_data_dir = self.output_dir / 'training_data'
-        self.training_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Do NOT define self.output_dir or subdirectories here
+        # since we don't know the country_code or haven't called run_pipeline yet.
+        self.output_dir = None
+        self.scaling_params = None
+        self.scaling_metadata = None
 
     def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False) -> None:
-        """
-        Run the model building pipeline.
-
-        This method handles data preparation, uploads training data to S3,
-        initiates model training via SageMaker AutoML, monitors the training job,
-        retrieves the best model, and saves scaling parameters.
-
-        Args:
-            country_code (str): The country code for which to build the model.
-            input_file (str): Path to the input CSV file.
-            backtesting (bool): Flag to indicate if backtesting is to be performed.
-
-        Raises:
-            RuntimeError: If the training job fails to complete successfully.
-        """
         try:
             self.logger.info(f"Running pipeline for country: {country_code}")
 
@@ -80,8 +60,16 @@ class CashForecastingPipeline:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.logger.info(f"Output directory set to: {self.output_dir}")
 
-            # Load and prepare data
+            # Create subdirectories after self.output_dir is set
+            self.scaling_dir = self.output_dir / 'scaling'
+            self.scaling_dir.mkdir(parents=True, exist_ok=True)
+
+            self.training_data_dir = self.output_dir / 'training_data'
+            self.training_data_dir.mkdir(parents=True, exist_ok=True)
+
+            # Prepare data
             train_file, inference_template_file = self.prepare_data(input_file, country_code)
+
 
             # Upload training data to S3
             train_data_s3_uri = self.upload_training_data(train_file, country_code)
@@ -118,6 +106,7 @@ class CashForecastingPipeline:
         - Handling missing values
         - Splitting data into training and testing sets
         - Scaling the data
+        - Recording the training schema for later inference-time validation (Step 1)
 
         Args:
             input_file (str): Path to the input CSV file.
@@ -131,6 +120,18 @@ class CashForecastingPipeline:
         # Load data using DataProcessor
         data = self.data_processor.load_data(input_file)
         self.logger.info(f"Loaded data with shape {data.shape}")
+
+        # --------------------------------------
+        # Step 1: Record the Training Schema
+        # We capture the exact set of columns present in the training data after initial loading.
+        # This schema will be used at inference to strictly validate inference data.
+        # No placeholders or assumptions are made here; we rely on the training data being complete.
+        final_training_columns = data.columns.tolist()
+        training_schema_file = self.output_dir / "training_schema.json"
+        with open(training_schema_file, "w") as f:
+            json.dump(final_training_columns, f, indent=2)
+        self.logger.info(f"Training schema saved at {training_schema_file}")
+        # --------------------------------------
 
         # 1. Convert timestamp to datetime with validation
         try:
@@ -152,7 +153,7 @@ class CashForecastingPipeline:
             data = data.sort_values(
                 by=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
                 ascending=[True, True, True, True],
-                na_position='first'  # Handle any NAs consistently
+                na_position='first'
             )
             self.logger.info("Multi-level sort completed successfully")
         except Exception as e:
@@ -161,7 +162,7 @@ class CashForecastingPipeline:
 
         # 4. Verify sort integrity
         for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
-            # Check if timestamps are strictly increasing within group
+            # Check monotonic increase
             if not group_data['EffectiveDate'].is_monotonic_increasing:
                 self.logger.error(f"Non-monotonic timestamps found in group {group_key}")
                 raise ValueError(f"Time series integrity violated in group {group_key}")
@@ -170,7 +171,6 @@ class CashForecastingPipeline:
             duplicates = group_data.duplicated(subset=['EffectiveDate'], keep=False)
             if duplicates.any():
                 self.logger.warning(f"Duplicate timestamps found in group {group_key}")
-                # Log the duplicates for investigation
                 self.logger.warning(f"Duplicate records:\n{group_data[duplicates]}")
 
         # 5. Handle gaps in time series
@@ -186,28 +186,30 @@ class CashForecastingPipeline:
 
         if groups_with_gaps:
             self.logger.warning(f"Found gaps in time series for groups: {groups_with_gaps}")
-            # Optionally, implement gap filling or further handling here
+            # If gap handling is required, implement it here.
 
-        self.logger.info(f"Data preparation completed. Processed {len(data)} records across "
-                         f"{len(data.groupby(['ProductId', 'BranchId', 'Currency']))} groups")
+        self.logger.info(
+            f"Data preparation completed. Processed {len(data)} records across "
+            f"{len(data.groupby(['ProductId', 'BranchId', 'Currency']))} groups"
+        )
 
-        # Handle missing values during data preparation
-        data = data.ffill().bfill()  # Updated to use ffill and bfill directly to avoid FutureWarning
+        # Handle missing values by forward and backward filling
+        data = data.ffill().bfill()
         self.logger.info("Handled missing values with forward fill and backfill strategies")
 
-        # Proceed with splitting and scaling as per original methodology
+        # Split the data into training and testing sets
         train_df, test_df = self._split_data(data)
+
+        # Scale the training data
         scaled_data, scaling_params = self.data_processor.prepare_data(train_df, country_code)
 
-        # Assign scaling parameters to the pipeline for later use
+        # Assign scaling parameters for later use
         self.scaling_params = scaling_params
 
         # Generate scaling metadata
         self.scaling_metadata = self.data_processor.generate_scaling_metadata(train_df, scaling_params)
 
-        # Save the data
-
-        # Save train and test data in training_data directory
+        # Save the training and testing data
         train_file = self.training_data_dir / f"{country_code}_train.csv"
         test_file = self.training_data_dir / f"{country_code}_test.csv"
 
@@ -217,14 +219,7 @@ class CashForecastingPipeline:
         self.logger.info(f"Training data saved to {train_file}")
         self.logger.info(f"Test data saved to {test_file}")
 
-        scaled_data.to_csv(train_file, index=False)
-        test_df.to_csv(test_file, index=False)
-
-        self.logger.info(f"Training data saved to {train_file}")
-        self.logger.info(f"Test data saved to {test_file}")
-
         # Save scaling parameters and metadata locally
-
         scaling_params_file = self.scaling_dir / f"{country_code}_scaling_params.json"
         scaling_metadata_file = self.scaling_dir / f"{country_code}_scaling_metadata.json"
 
@@ -232,41 +227,53 @@ class CashForecastingPipeline:
         self.data_processor.save_metadata(self.scaling_metadata, scaling_metadata_file)
 
         self.logger.info(
-            f"Scaling parameters and metadata saved locally at {scaling_params_file} and {scaling_metadata_file}")
+            f"Scaling parameters and metadata saved locally at {scaling_params_file} and {scaling_metadata_file}"
+        )
 
+        # Re-save scaling parameters and metadata if needed (redundant here, but kept as per original code)
         self.data_processor.save_scaling_params(scaling_params, scaling_params_file)
         self.data_processor.save_metadata(self.scaling_metadata, scaling_metadata_file)
 
         # Generate inference template
+        # The inference template will be strictly based on the final training data schema recorded above.
         inference_template_file = self.generate_inference_template(data, country_code)
         self.logger.info(f"Inference template saved to {inference_template_file}")
 
         return str(train_file), str(inference_template_file)
 
     def generate_inference_template(self, data: pd.DataFrame, country_code: str) -> str:
-        """
-        Generate an inference template based on the training data.
-
-        This template is used to ensure that inference data aligns with training data's structure.
-
-        Args:
-            data (pd.DataFrame): The prepared training data.
-            country_code (str): The country code.
-
-        Returns:
-            str: Path to the inference template CSV file.
-        """
         self.logger.info("Generating inference template")
 
-        # Assuming the inference template should include unique combinations of ProductId, BranchId, Currency
-        inference_template = data[['ProductId', 'BranchId', 'Currency']].drop_duplicates().copy()
-        # Add 'ForecastDate' for forecasting horizon (e.g., next date)
-        # This can be adjusted based on forecasting requirements
-        last_dates = data.groupby(['ProductId', 'BranchId', 'Currency'])['EffectiveDate'].max().reset_index()
-        last_dates['ForecastDate'] = last_dates['EffectiveDate'] + pd.to_timedelta(1, unit='D')  # Example: next day
-        inference_template = inference_template.merge(last_dates[['ProductId', 'BranchId', 'Currency', 'ForecastDate']],
-                                                      on=['ProductId', 'BranchId', 'Currency'],
-                                                      how='left')
+        required_columns = data.columns.tolist()
+        self.logger.info(f"Training data columns (required schema): {required_columns}")
+
+        # Check essential columns
+        essential_cols = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate']
+        missing_essential = [col for col in essential_cols if col not in data.columns]
+        if missing_essential:
+            self.logger.error(f"Training data missing essential columns: {missing_essential}")
+            raise ValueError(f"Cannot create inference template without {missing_essential} columns.")
+
+        # Sort and group by (ProductId, BranchId, Currency) to get the last row for each group
+        data_sorted = data.sort_values(by=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'])
+        last_rows = data_sorted.groupby(['ProductId', 'BranchId', 'Currency'], as_index=False).last()
+
+        # **Remove ForecastDate generation**
+        # last_rows['ForecastDate'] = last_rows['EffectiveDate'] + pd.Timedelta(days=1)
+
+        # Check that all required columns are present in last_rows
+        missing_required = [col for col in required_columns if col not in last_rows.columns]
+        if missing_required:
+            self.logger.error(f"Missing required columns in derived template: {missing_required}")
+            raise ValueError(f"Cannot produce a complete inference template. Missing columns: {missing_required}")
+
+        # **Exclude ForecastDate from the inference template**
+        inference_template = last_rows[required_columns]
+
+        # Final check: Ensure no ForecastDate is present
+        if 'ForecastDate' in inference_template.columns:
+            self.logger.error("ForecastDate column should not be present in the inference template.")
+            raise ValueError("Inference template should not contain a 'ForecastDate' column.")
 
         # Save the inference template
         inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"

@@ -1,4 +1,23 @@
-# cash_forecast_inference.py
+"""
+Cash Forecasting Inference Script
+
+This script performs inference using a trained forecasting model on new data.
+It leverages shared utilities from common.py for configuration management,
+data processing, logging, and AWS interactions.
+
+Usage:
+
+
+ZM-model-20241219-064209
+20241219-064209
+python cs_scripts/cash_forecast_inference.py \
+    --config cs_scripts/config.yaml \
+    --countries ZM \
+    --model_timestamp 20241219-064209 \
+    --effective_date 2024-07-01 \
+    --model_name ZM-model-20241219-064209 \
+    --inference_template ./output/ZM/20241219-064209/ZM_inference_template.csv
+"""
 
 import shutil
 import sys
@@ -26,10 +45,7 @@ import json
 
 
 class CashForecastingPipeline:
-    """Pipeline for performing inference with trained cash demand models."""
-
     def __init__(self, config: Config, logger: logging.Logger):
-        """Initialize the inference pipeline with configuration."""
         self.config = config
         self.logger = logger
         self.session = Session()
@@ -38,10 +54,14 @@ class CashForecastingPipeline:
         self.data_processor = DataProcessor(logger=self.logger)
         self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
         self.role = self.config.role_arn
-        self.output_dir: Optional[Path] = None
-        self.scaling_params: Optional[Dict[str, Dict[str, float]]] = None
-        self.scaling_metadata: Optional[Dict[str, Any]] = None
-        # After self.output_dir = Path(f"./output/{country_code}/{self.timestamp}")
+
+        self.output_dir = None
+
+    def setup_directories(self, country_code: str, model_timestamp: str) -> None:
+        self.output_dir = Path(f"./output/{country_code}/{model_timestamp}")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
         self.scaling_dir = self.output_dir / 'scaling'
         self.scaling_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,6 +73,7 @@ class CashForecastingPipeline:
 
         self.transform_outputs_dir = self.inference_dir / 'transform_outputs'
         self.transform_outputs_dir.mkdir(parents=True, exist_ok=True)
+
 
     def load_scaling_parameters(self, country_code: str, model_timestamp: str) -> None:
         """
@@ -101,16 +122,19 @@ class CashForecastingPipeline:
         self.scaling_params = scaling_params
         self.scaling_metadata = scaling_metadata
 
-        # Clean up temporary files
-        scaling_params_path.unlink(missing_ok=True)
-        scaling_metadata_path.unlink(missing_ok=True)
+
 
         self.logger.info(f"Scaling parameters and metadata loaded and validated for {country_code}")
 
     def prepare_inference_data(self, country_code: str, effective_date: str, inference_template_path: str) -> str:
         """
-        Prepare inference data by scaling the 'Demand' column if present,
-        or setting 'Demand_scaled' based on the last known value from scaling parameters.
+        Prepare inference data by ensuring it aligns with the training schema and applying scaling.
+
+        Steps implemented from best practices (beyond what was done at training):
+        2. Load and Validate Inference Data Against the Schema
+        3. Fail Fast on Non-Compliance
+        4. Check Data Integrity Conditions
+        5. Test the Inference Process with Sample Data (done externally, not in code)
 
         Args:
             country_code (str): The country code.
@@ -121,56 +145,107 @@ class CashForecastingPipeline:
             str: Path to the scaled inference CSV file.
 
         Raises:
-            ValueError: If scaling parameters are missing for any combination.
+            ValueError: If required columns are missing, data types are incorrect, scaling parameters are missing,
+                        or data integrity conditions are not met.
         """
+        # Step 2: Load and Validate Inference Data Against the Schema
+        # Load the saved training schema to know exactly which columns and data types we expect
+        training_schema_file = self.output_dir / "training_schema.json"
+        if not training_schema_file.exists():
+            self.logger.error(f"Training schema file not found at {training_schema_file}")
+            raise FileNotFoundError(
+                "training_schema.json is missing. Cannot validate inference template without schema.")
+
+        with open(training_schema_file, "r") as f:
+            schema = json.load(f)
+
+        required_columns = schema['columns']  # Assuming schema has a 'columns' key with column names
+        column_types = schema.get('column_types', {})  # Optional: data types per column
+
         # Load inference data
         inference_df = pd.read_csv(inference_template_path)
-        self.logger.info(f"Loaded data with shape {inference_df.shape}")
+        self.logger.info(f"Loaded inference template with shape {inference_df.shape}")
 
-        # **No need to filter 'IsValid' as the inference template excludes invalid entries**
+        # Check for missing columns
+        missing_cols = set(required_columns) - set(inference_df.columns)
+        if missing_cols:
+            self.logger.error(f"Missing required columns in inference data: {missing_cols}")
+            raise ValueError(f"Inference data is missing columns required by the model: {missing_cols}")
 
-        # **Create scaling keys based only on Currency and BranchId**
+        # Check for unexpected extra columns
+        extra_cols = set(inference_df.columns) - set(required_columns)
+        if extra_cols:
+            self.logger.warning(f"Extra columns present in inference data: {extra_cols}. They will be dropped.")
+            inference_df = inference_df[list(required_columns)]
+
+        # Enforce data types if specified
+        for col, dtype in column_types.items():
+            if col in inference_df.columns:
+                try:
+                    inference_df[col] = inference_df[col].astype(dtype)
+                    self.logger.debug(f"Converted column '{col}' to type '{dtype}'.")
+                except Exception as e:
+                    self.logger.error(f"Failed to convert column '{col}' to type '{dtype}': {e}")
+                    raise ValueError(f"Column '{col}' has incorrect data type.")
+
+        # Step 4: Check Data Integrity Conditions
+        critical_cols_no_nan = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate']
+        for col in critical_cols_no_nan:
+            if inference_df[col].isnull().any():
+                self.logger.error(f"Column {col} contains NaN values, which is not allowed.")
+                raise ValueError(f"Integrity check failed: {col} has NaN values at inference.")
+
+        # Proceed with scaling now that schema compliance and integrity checks passed
+        # Create scaling keys
+        if 'Currency' not in inference_df.columns or 'BranchId' not in inference_df.columns:
+            self.logger.error("Inference data must contain 'Currency' and 'BranchId' to create ScalingKey.")
+            raise ValueError("Missing 'Currency' or 'BranchId' for scaling operations.")
+
         inference_df['ScalingKey'] = inference_df['Currency'] + '_' + inference_df['BranchId'].astype(str)
 
-        # Map scaling parameters
+        # Retrieve scaling parameters (assume self.scaling_params is already loaded)
         scaling_means = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('mean'))
         scaling_stds = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('std'))
 
         # Identify missing scaling parameters
-        missing = inference_df[scaling_means.isnull() | scaling_stds.isnull()]
-        if not missing.empty:
+        missing_scaling = inference_df[scaling_means.isnull() | scaling_stds.isnull()]
+        if not missing_scaling.empty:
             self.logger.error(
-                f"Missing scaling parameters for combinations:\n{missing[['ProductId', 'BranchId', 'Currency']]}")
+                f"Missing scaling parameters for combinations:\n{missing_scaling[['ProductId', 'BranchId', 'Currency']]}")
             raise ValueError("Missing scaling parameters for some combinations in the inference template.")
 
-        # Handle 'Demand' column absence
-        if 'Demand' in inference_df.columns:
-            # Apply scaling if 'Demand' exists
-            inference_df['Demand_scaled'] = (inference_df['Demand'] - scaling_means) / scaling_stds
-            self.logger.info("'Demand' column found. Applied scaling to 'Demand'.")
-        else:
-            # Set 'Demand_scaled' based on 'last_value' from scaling parameters
-            self.logger.warning(
-                "'Demand' column not found in inference data. Setting 'Demand_scaled' based on last known value.")
-            inference_df['Demand_scaled'] = inference_df['ScalingKey'].map(
-                lambda x: (self.scaling_params.get(x, {}).get('last_value', 0) - self.scaling_params.get(x, {}).get(
-                    'mean', 0)) /
-                          (self.scaling_params.get(x, {}).get('std', 1) or 1)
-            )
-            self.logger.info("Set 'Demand_scaled' based on 'last_value' from scaling parameters.")
+        # Check if 'Demand' is present if required by schema
+        if 'Demand' in required_columns:
+            if 'Demand' not in inference_df.columns:
+                self.logger.error("Demand column is required by the schema but is missing at inference.")
+                raise ValueError("Demand column missing at inference time.")
 
-        # Ensure 'Demand_scaled' is not NaN
-        if inference_df['Demand_scaled'].isnull().any():
-            self.logger.error("Some 'Demand_scaled' values are NaN. Please check scaling parameters.")
-            raise ValueError("NaN values found in 'Demand_scaled' column.")
+            # Apply scaling to 'Demand'
+            valid_stds = scaling_stds.replace({0: np.nan})
+            if valid_stds.isnull().any():
+                self.logger.error("Scaling std is zero for some combinations, cannot scale 'Demand'.")
+                raise ValueError("Scaling standard deviation is zero for some combinations, cannot scale Demand.")
+
+            inference_df['Demand_scaled'] = (inference_df['Demand'] - scaling_means) / valid_stds
+            if inference_df['Demand_scaled'].isnull().any():
+                self.logger.error(
+                    "Some 'Demand_scaled' values are NaN after scaling. Check scaling parameters or input data.")
+                raise ValueError("NaN values found in 'Demand_scaled' column after scaling.")
+            self.logger.info("'Demand' column found and scaled successfully.")
+        else:
+            # If Demand is not required, no scaling needed
+            self.logger.info("'Demand' column not required by schema, skipping scaling.")
+
+        # Step 5: Test the Inference Process with Sample Data (Not implemented here as code)
+        # This is done externally, before putting into production.
+        # The user can run a dry run with a sample inference file and check logs.
 
         # Save the scaled inference data
-
         scaled_inference_file = self.inference_dir / f"scaled_inference_{country_code}.csv"
         inference_df.to_csv(scaled_inference_file, index=False)
         self.logger.info(f"Scaled inference data saved to {scaled_inference_file}")
-        return str(scaled_inference_file)
 
+        return str(scaled_inference_file)
 
     def upload_inference_data(self, inference_file: str, country_code: str) -> str:
         """
@@ -188,7 +263,7 @@ class CashForecastingPipeline:
         """
         self.logger.info(f"Uploading inference data for country: {country_code}")
         try:
-            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference/{Path(inference_file).name}"
+            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/scaling/inference/{Path(inference_file).name}"
             self.s3_handler.safe_upload(local_path=inference_file, bucket=self.config.bucket, s3_key=s3_inference_key,
                                         overwrite=True)
             s3_inference_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
@@ -269,11 +344,10 @@ class CashForecastingPipeline:
                         failure_reason = response.get('FailureReason', 'No failure reason provided.')
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
                         # Download logs before raising exception
-                        self.download_transform_job_logs(transform_job_name,
-                                                         country_code=transform_job_name.split('-')[0])
+                        self.download_transform_job_logs(transform_job_name, transform_job_name.split('-')[0])
+                        # Raise an exception and then break out of the loop
                         raise RuntimeError(
-                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}"
-                        )
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
                     self.logger.info(f"Transform job {transform_job_name} completed successfully.")
                     break
 
@@ -434,36 +508,20 @@ class CashForecastingPipeline:
                 self.logger.info(f"Downloaded forecast file {key} to {local_file}")
 
                 # Read forecast data, skipping the first two rows (headers and metadata)
-                # Adjust 'sep' if your CSV uses a different delimiter
                 df = pd.read_csv(local_file, header=None, skiprows=2, sep=',')  # Change sep if needed
 
-                # Debugging: Log the DataFrame shape and first few rows
-                self.logger.debug(f"Forecast DataFrame shape after reading CSV: {df.shape}")
-                self.logger.debug(f"Forecast DataFrame columns before assignment: {df.columns.tolist()}")
-                self.logger.debug(f"Forecast DataFrame head:\n{df.head()}")
-
                 # Assign meaningful column names based on known structure
-                # Ensure the number of column names matches the actual number of columns in df
-                expected_columns = {
-                    8: [
-                        'Currency', 'BranchId', 'ProductId', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean'
-                    ],
-                    10: [
-                        'Currency', 'BranchId', 'ProductId', 'BranchId_dup',
-                        'Currency_dup', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean'
-                    ]
-                }
-
-                num_columns = len(df.columns)
-                if num_columns in expected_columns:
-                    df.columns = expected_columns[num_columns]
+                # Assuming 8 columns: Currency, BranchId, ProductId, EffectiveDate, p10, p50, p90, mean
+                expected_num_columns = 8
+                if len(df.columns) == expected_num_columns:
+                    df.columns = ['Currency', 'BranchId', 'ProductId', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean']
                     self.logger.debug(f"Assigned column names: {df.columns.tolist()}")
                 else:
                     self.logger.error(
-                        f"Unexpected number of columns ({num_columns}) in forecast file {key}. Expected {list(expected_columns.keys())}."
+                        f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected {expected_num_columns} columns."
                     )
                     raise ValueError(
-                        f"Unexpected number of columns ({num_columns}) in forecast file {key}. Expected {list(expected_columns.keys())}."
+                        f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected {expected_num_columns} columns."
                     )
 
                 # Extract only the quantile columns
@@ -487,7 +545,12 @@ class CashForecastingPipeline:
 
             # Combine all forecast DataFrames
             combined_forecast = pd.concat(forecast_dfs, ignore_index=True)
-            self.logger.info(f"Combined forecast data shape: {combined_forecast.shape}")
+
+            # Sort the combined forecast by ProductId, BranchId, Currency to ensure grouping
+            combined_forecast = combined_forecast.sort_values(by=['ProductId', 'BranchId', 'Currency']).reset_index(
+                drop=True)
+
+            self.logger.info(f"Combined and sorted forecast data shape: {combined_forecast.shape}")
 
             return combined_forecast
 
@@ -507,16 +570,18 @@ class CashForecastingPipeline:
         self.logger.info("Restoring original scale to forecasted Demand values.")
         try:
             # Corrected file path to load the scaled inference data
-            inference_csv = self.output_dir / f"scaled_inference_{country_code}.csv"
+            inference_csv = self.inference_dir / f"scaled_inference_{country_code}.csv"
 
             if not inference_csv.exists():
                 self.logger.error(f"Inference CSV file does not exist: {inference_csv}")
                 raise FileNotFoundError(f"Inference CSV file does not exist: {inference_csv}")
 
             inference_data = self.data_processor.load_data(str(inference_csv))
+            self.logger.info(f"inference_csv: {inference_csv}")
+            self.logger.info(f"Columns in inference_data: {list(inference_data.columns)}")
 
             # Check for required columns
-            required_columns = ['ProductId', 'BranchId', 'Currency', 'ForecastDate']
+            required_columns = ['ProductId', 'BranchId', 'Currency']
             missing_cols = set(required_columns) - set(inference_data.columns)
             if missing_cols:
                 self.logger.error(f"Inference CSV is missing required columns: {missing_cols}")
@@ -527,9 +592,8 @@ class CashForecastingPipeline:
                 self.logger.error("'Demand_scaled' column is missing from the inference data.")
                 raise KeyError("'Demand_scaled' column is missing from the inference data.")
 
-            # Re-attach necessary columns: ProductId and ForecastDate
-            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency', 'ForecastDate']].reset_index(
-                drop=True).join(forecast_df)
+            # Re-attach necessary columns: ProductId, BranchId, and Currency
+            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency']].reset_index(drop=True).join(forecast_df)
 
             # Create scaling_key column
             forecast_df['scaling_key'] = forecast_df.apply(lambda row: f"{row['Currency']}_{row['BranchId']}", axis=1)
@@ -577,7 +641,7 @@ class CashForecastingPipeline:
         Raises:
             ValueError: If validation fails.
         """
-        required_columns = ['ProductId', 'BranchId', 'Currency', 'ForecastDate', 'p10', 'Demand', 'p90']
+        required_columns = ['ProductId', 'BranchId', 'Currency', 'p10', 'Demand', 'p90']
         missing_columns = set(required_columns) - set(forecast_df.columns)
         if missing_columns:
             raise ValueError(f"Missing required columns in forecast data: {missing_columns}")
@@ -652,8 +716,69 @@ class CashForecastingPipeline:
             self.logger.error(f"Failed to generate statistical report: {e}")
             raise
 
+    def map_forecasts_to_dates(self, restored_forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:
+        """
+        Map forecasted quantiles to future dates based on the last EffectiveDate.
+
+        Args:
+            restored_forecast_df (pd.DataFrame): DataFrame with restored forecasts.
+            country_code (str): The country code.
+
+        Returns:
+            pd.DataFrame: Forecast DataFrame with mapped dates.
+        """
+        self.logger.info("Mapping forecasts to future dates.")
+
+        # Load the scaled inference data to get the last EffectiveDate per item
+        inference_csv = self.inference_dir / f"scaled_inference_{country_code}.csv"
+        inference_data = self.data_processor.load_data(str(inference_csv))
+
+        # Ensure 'EffectiveDate' is in datetime format
+        if 'EffectiveDate' not in inference_data.columns:
+            self.logger.error("'EffectiveDate' column is missing from the inference data.")
+            raise KeyError("'EffectiveDate' column is missing from the inference data.")
+
+        inference_data['EffectiveDate'] = pd.to_datetime(inference_data['EffectiveDate'])
+
+        # Get the last EffectiveDate for each (ProductId, BranchId, Currency) group
+        last_dates = inference_data.groupby(['ProductId', 'BranchId', 'Currency'], as_index=False)[
+            'EffectiveDate'].max()
+
+        self.logger.info(f"Last EffectiveDate per item calculated.")
+
+        # Merge the last EffectiveDate with the forecast DataFrame
+        # Assuming that restored_forecast_df has forecasts ordered per item and per forecast horizon
+        # Determine the number of forecasts per item based on forecast_horizon
+        forecast_horizon = self.config.forecast_horizon  # Ensure this is defined and an integer
+        quantiles = self.config.quantiles  # ['p10', 'p50', 'p90']
+
+        num_items = len(last_dates)
+        expected_forecasts = num_items * forecast_horizon
+
+        if len(restored_forecast_df) != expected_forecasts:
+            self.logger.error(
+                f"Forecast DataFrame size mismatch: expected {expected_forecasts} rows "
+                f"({num_items} items * {forecast_horizon} forecast horizon), got {len(restored_forecast_df)} rows."
+            )
+            raise ValueError(
+                f"Forecast DataFrame size mismatch: expected {expected_forecasts} rows "
+                f"({num_items} items * {forecast_horizon} forecast horizon), got {len(restored_forecast_df)} rows."
+            )
+
+        # Create a list of future dates per item
+        future_dates = []
+        for _, row in last_dates.iterrows():
+            item_future_dates = [row['EffectiveDate'] + pd.Timedelta(days=i) for i in range(1, forecast_horizon + 1)]
+            future_dates.extend(item_future_dates)
+
+        # Assign the future dates to the forecast DataFrame
+        restored_forecast_df['ForecastDate'] = future_dates
+
+        self.logger.info("Mapped forecasts to future dates successfully.")
+        return restored_forecast_df
+
     def run_inference(self, country_code: str, model_name: str, effective_date: str,
-                      inference_template_path: str) -> None:
+                      inference_template_path: str, model_timestamp: str) -> None:
         """
         Execute the complete inference pipeline.
 
@@ -666,6 +791,17 @@ class CashForecastingPipeline:
         Raises:
             Exception: If any step in the pipeline fails.
         """
+
+
+        self.setup_directories(country_code, model_timestamp)
+
+        # Now directories (including scaling_dir) exist. Load scaling parameters here.
+        self.load_scaling_parameters(country_code, model_timestamp)
+
+        self.logger.info(f"Starting inference pipeline for country: {country_code}")
+
+        # Now scaling_dir is defined
+
         try:
             self.logger.info(f"Starting inference pipeline for country: {country_code}")
 
@@ -691,7 +827,7 @@ class CashForecastingPipeline:
             # For example, combine CSVs, perform post-processing, etc.
 
             # Download scaled inference data locally if not already saved
-            scaled_inference_file = Path(f"scaled_inference_{country_code}.csv")
+            scaled_inference_file = self.inference_dir / f"scaled_inference_{country_code}.csv"
             if not scaled_inference_file.exists():
                 shutil.copy(inference_file, scaled_inference_file)
                 self.logger.info(f"Copied scaled inference data to {scaled_inference_file}")
@@ -701,7 +837,7 @@ class CashForecastingPipeline:
 
             # Restore original scale
             restored_forecast_df = self.restore_forecasts_scale(forecast_df, country_code)
-
+            restored_forecast_df = self.map_forecasts_to_dates(restored_forecast_df, country_code)
             # Validate forecast data
             self.validate_forecast_data(restored_forecast_df)
 
@@ -738,9 +874,7 @@ def main():
         inference_pipeline = CashForecastingPipeline(config=config, logger=logger)
 
         # Create the output directory
-        inference_pipeline.output_dir = Path(f"./output/{args.countries[0]}/{inference_pipeline.timestamp}")
-        inference_pipeline.output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Output directory set to: {inference_pipeline.output_dir}")
+
 
         # Process each country
         for country_code in args.countries:
@@ -748,15 +882,21 @@ def main():
                 logger.info(f"\nProcessing country: {country_code}")
 
                 # Load and validate scaling parameters
-                inference_pipeline.load_scaling_parameters(country_code, args.model_timestamp)
 
+
+                # inference_pipeline.run_inference(
+                #     country_code=args.countries[0],
+                #     model_name=args.model_name,
+                #     effective_date=args.effective_date,
+                #     inference_template_path=args.inference_template
+                # )
                 # Run inference
                 inference_pipeline.run_inference(
                     country_code=country_code,
                     model_name=args.model_name,
                     effective_date=args.effective_date,
-                    inference_template_path=args.inference_template
-                )
+                    inference_template_path=args.inference_template,
+                    model_timestamp=args.model_timestamp)
 
             except Exception as e:
                 logger.error(f"Failed to process country {country_code}: {e}")
