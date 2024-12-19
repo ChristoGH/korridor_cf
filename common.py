@@ -1,3 +1,4 @@
+
 """
 Common utilities and shared functionality for cash forecasting pipeline.
 
@@ -23,8 +24,7 @@ import shutil
 
 
 class MonitoringDatasetFormat(BaseModel):
-    """Pydantic model for monitoring dataset format."""
-    json_format: str  # Renamed from 'json' to 'json_format' to avoid shadowing
+    json_format: str  # Renamed from 'json' to 'json_format'
     # Add other fields as necessary
 
     @field_validator('json_format')
