@@ -25,11 +25,14 @@ from pathlib import Path
 from time import gmtime, strftime, sleep
 from datetime import datetime
 import logging
-
+from tempfile import TemporaryDirectory
 import pandas as pd
 import numpy as np
 import boto3
 from sagemaker import Session
+import time
+from botocore.exceptions import ClientError
+import uuid
 
 from common import (
     ConfigModel,
@@ -52,10 +55,11 @@ class CashForecastingPipeline:
         self.sm_client = boto3.client('sagemaker', region_name=self.config.region)
         self.s3_handler = S3Handler(region=self.config.region, logger=self.logger)
         self.data_processor = DataProcessor(logger=self.logger)
-        self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
+        self.timestamp = strftime("%Y%m%d-%H%M%S", gmtime())  # Retained for potential other uses
         self.role = self.config.role_arn
 
         self.output_dir = None
+        self.model_timestamp = None  # Initialize as None
 
     def setup_directories(self, country_code: str, model_timestamp: str) -> None:
         self.output_dir = Path(f"./output/{country_code}/{model_timestamp}")
@@ -73,7 +77,6 @@ class CashForecastingPipeline:
 
         self.transform_outputs_dir = self.inference_dir / 'transform_outputs'
         self.transform_outputs_dir.mkdir(parents=True, exist_ok=True)
-
 
     def load_scaling_parameters(self, country_code: str, model_timestamp: str) -> None:
         """
@@ -102,14 +105,15 @@ class CashForecastingPipeline:
         self.s3_handler.download_file(bucket=self.config.bucket, s3_key=scaling_metadata_key,
                                       local_path=scaling_metadata_path)
         scaling_metadata = self.data_processor.load_scaling_metadata(scaling_metadata_file=scaling_metadata_path)
-        # Previously downloaded to ./temp
+
+        # Save scaling parameters and metadata locally
         local_scaling_params_file = self.scaling_dir / f"{country_code}_scaling_params.json"
         local_scaling_metadata_file = self.scaling_dir / f"{country_code}_scaling_metadata.json"
 
         shutil.copy(scaling_params_path, local_scaling_params_file)
         shutil.copy(scaling_metadata_path, local_scaling_metadata_file)
 
-        # Now remove the temp files
+        # Remove temporary files
         scaling_params_path.unlink(missing_ok=True)
         scaling_metadata_path.unlink(missing_ok=True)
 
@@ -122,19 +126,11 @@ class CashForecastingPipeline:
         self.scaling_params = scaling_params
         self.scaling_metadata = scaling_metadata
 
-
-
         self.logger.info(f"Scaling parameters and metadata loaded and validated for {country_code}")
 
     def prepare_inference_data(self, country_code: str, effective_date: str, inference_template_path: str) -> str:
         """
         Prepare inference data by ensuring it aligns with the training schema and applying scaling.
-
-        Steps implemented from best practices (beyond what was done at training):
-        2. Load and Validate Inference Data Against the Schema
-        3. Fail Fast on Non-Compliance
-        4. Check Data Integrity Conditions
-        5. Test the Inference Process with Sample Data (done externally, not in code)
 
         Args:
             country_code (str): The country code.
@@ -148,8 +144,7 @@ class CashForecastingPipeline:
             ValueError: If required columns are missing, data types are incorrect, scaling parameters are missing,
                         or data integrity conditions are not met.
         """
-        # Step 2: Load and Validate Inference Data Against the Schema
-        # Load the saved training schema to know exactly which columns and data types we expect
+        # Load the training schema
         training_schema_file = self.output_dir / "training_schema.json"
         if not training_schema_file.exists():
             self.logger.error(f"Training schema file not found at {training_schema_file}")
@@ -188,22 +183,21 @@ class CashForecastingPipeline:
                     self.logger.error(f"Failed to convert column '{col}' to type '{dtype}': {e}")
                     raise ValueError(f"Column '{col}' has incorrect data type.")
 
-        # Step 4: Check Data Integrity Conditions
+        # Check data integrity
         critical_cols_no_nan = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate']
         for col in critical_cols_no_nan:
             if inference_df[col].isnull().any():
                 self.logger.error(f"Column {col} contains NaN values, which is not allowed.")
                 raise ValueError(f"Integrity check failed: {col} has NaN values at inference.")
 
-        # Proceed with scaling now that schema compliance and integrity checks passed
-        # Create scaling keys
+        # Create scaling key
         if 'Currency' not in inference_df.columns or 'BranchId' not in inference_df.columns:
             self.logger.error("Inference data must contain 'Currency' and 'BranchId' to create ScalingKey.")
             raise ValueError("Missing 'Currency' or 'BranchId' for scaling operations.")
 
         inference_df['ScalingKey'] = inference_df['Currency'] + '_' + inference_df['BranchId'].astype(str)
 
-        # Retrieve scaling parameters (assume self.scaling_params is already loaded)
+        # Retrieve scaling parameters
         scaling_means = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('mean'))
         scaling_stds = inference_df['ScalingKey'].map(lambda x: self.scaling_params.get(x, {}).get('std'))
 
@@ -211,16 +205,17 @@ class CashForecastingPipeline:
         missing_scaling = inference_df[scaling_means.isnull() | scaling_stds.isnull()]
         if not missing_scaling.empty:
             self.logger.error(
-                f"Missing scaling parameters for combinations:\n{missing_scaling[['ProductId', 'BranchId', 'Currency']]}")
+                f"Missing scaling parameters for combinations:\n{missing_scaling[['ProductId', 'BranchId', 'Currency']]}"
+            )
             raise ValueError("Missing scaling parameters for some combinations in the inference template.")
 
-        # Check if 'Demand' is present if required by schema
+        # Apply scaling to 'Demand' if required
         if 'Demand' in required_columns:
             if 'Demand' not in inference_df.columns:
                 self.logger.error("Demand column is required by the schema but is missing at inference.")
                 raise ValueError("Demand column missing at inference time.")
 
-            # Apply scaling to 'Demand'
+            # Apply scaling
             valid_stds = scaling_stds.replace({0: np.nan})
             if valid_stds.isnull().any():
                 self.logger.error("Scaling std is zero for some combinations, cannot scale 'Demand'.")
@@ -233,12 +228,7 @@ class CashForecastingPipeline:
                 raise ValueError("NaN values found in 'Demand_scaled' column after scaling.")
             self.logger.info("'Demand' column found and scaled successfully.")
         else:
-            # If Demand is not required, no scaling needed
             self.logger.info("'Demand' column not required by schema, skipping scaling.")
-
-        # Step 5: Test the Inference Process with Sample Data (Not implemented here as code)
-        # This is done externally, before putting into production.
-        # The user can run a dry run with a sample inference file and check logs.
 
         # Save the scaled inference data
         scaled_inference_file = self.inference_dir / f"scaled_inference_{country_code}.csv"
@@ -263,9 +253,14 @@ class CashForecastingPipeline:
         """
         self.logger.info(f"Uploading inference data for country: {country_code}")
         try:
-            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.timestamp}/scaling/inference/{Path(inference_file).name}"
-            self.s3_handler.safe_upload(local_path=inference_file, bucket=self.config.bucket, s3_key=s3_inference_key,
-                                        overwrite=True)
+            # Use self.model_timestamp instead of self.timestamp for consistent path referencing
+            s3_inference_key = f"{self.config.prefix}-{country_code}/{self.model_timestamp}/scaling/inference/{Path(inference_file).name}"
+            self.s3_handler.safe_upload(
+                local_path=inference_file,
+                bucket=self.config.bucket,
+                s3_key=s3_inference_key,
+                overwrite=True
+            )
             s3_inference_uri = f"s3://{self.config.bucket}/{s3_inference_key}"
             self.logger.info(f"Inference data uploaded to {s3_inference_uri}")
             return s3_inference_uri
@@ -286,39 +281,66 @@ class CashForecastingPipeline:
             Exception: If the transform job fails.
         """
         self.logger.info(f"Starting batch transform for country: {country_code}")
-        transform_job_name = f"{country_code}-transform-{self.timestamp}"
+        # Use self.model_timestamp for transform job naming
+        transform_job_name = f"{country_code}-transform-{self.model_timestamp}"
 
-        output_s3_uri = f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
+        # Define output S3 URI using self.model_timestamp
+        output_s3_uri = f"s3://{self.config.bucket}/{self.config.prefix}-{country_code}/{self.model_timestamp}/inference-output/"
 
-        try:
-            self.sm_client.create_transform_job(
-                TransformJobName=transform_job_name,
-                ModelName=model_name,
-                BatchStrategy='MultiRecord',
-                TransformInput={
-                    'DataSource': {
-                        'S3DataSource': {
-                            'S3DataType': 'S3Prefix',
-                            'S3Uri': s3_inference_uri
-                        }
+        max_retries = 3
+        retry_delay = 5  # seconds
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.sm_client.create_transform_job(
+                    TransformJobName=transform_job_name,
+                    ModelName=model_name,
+                    BatchStrategy='MultiRecord',
+                    TransformInput={
+                        'DataSource': {
+                            'S3DataSource': {
+                                'S3DataType': 'S3Prefix',
+                                'S3Uri': s3_inference_uri
+                            }
+                        },
+                        'ContentType': 'text/csv',
+                        'SplitType': 'Line'
                     },
-                    'ContentType': 'text/csv',
-                    'SplitType': 'Line'
-                },
-                TransformOutput={
-                    'S3OutputPath': output_s3_uri,
-                    'AssembleWith': 'Line'
-                },
-                TransformResources={
-                    'InstanceType': self.config.instance_type,
-                    'InstanceCount': self.config.instance_count
-                }
-            )
-            self.logger.info(f"Transform job {transform_job_name} created successfully.")
-            self.monitor_transform_job(transform_job_name)
-        except Exception as e:
-            self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
-            raise
+                    TransformOutput={
+                        'S3OutputPath': output_s3_uri,
+                        'AssembleWith': 'Line'
+                    },
+                    TransformResources={
+                        'InstanceType': self.config.instance_type,
+                        'InstanceCount': self.config.instance_count
+                    }
+                )
+                self.logger.info(f"Transform job {transform_job_name} created successfully.")
+                self.monitor_transform_job(transform_job_name)
+                break  # Exit loop if successful
+            except self.sm_client.exceptions.ResourceInUse as e:
+                self.logger.error(f"Attempt {attempt}: Transform job name {transform_job_name} is already in use: {e}")
+                if attempt < max_retries:
+                    self.logger.info(f"Retrying after {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    # Generate a new unique suffix for the next attempt
+                    unique_suffix = uuid.uuid4().hex[:8]
+                    transform_job_name = f"{country_code}-transform-{self.model_timestamp}-{unique_suffix}"
+                else:
+                    self.logger.error(f"All {max_retries} attempts failed. Unable to create a unique transform job.")
+                    raise
+            except ClientError as e:
+                self.logger.error(f"ClientError on attempt {attempt}: {e}")
+                if attempt < max_retries:
+                    self.logger.info(f"Retrying after {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    self.logger.error(f"All {max_retries} attempts failed due to ClientError.")
+                    raise
+            except Exception as e:
+                self.logger.error(f"Failed to create transform job {transform_job_name}: {e}")
+                raise
+
 
     def monitor_transform_job(self, transform_job_name: str) -> None:
         """
@@ -345,9 +367,9 @@ class CashForecastingPipeline:
                         self.logger.error(f"Transform job {transform_job_name} failed: {failure_reason}")
                         # Download logs before raising exception
                         self.download_transform_job_logs(transform_job_name, transform_job_name.split('-')[0])
-                        # Raise an exception and then break out of the loop
                         raise RuntimeError(
-                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}")
+                            f"Transform job {transform_job_name} failed with status: {status}. Reason: {failure_reason}"
+                        )
                     self.logger.info(f"Transform job {transform_job_name} completed successfully.")
                     break
 
@@ -392,7 +414,6 @@ class CashForecastingPipeline:
             raise
 
         # Create local directory for transform outputs
-
         local_output_dir = self.transform_outputs_dir / transform_job_name
         local_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -404,7 +425,6 @@ class CashForecastingPipeline:
 
         self.logger.info(f"All transform outputs downloaded to {local_output_dir}")
         return local_output_dir
-
 
     def download_transform_job_logs(self, transform_job_name: str, country_code: str) -> Path:
         """
@@ -459,7 +479,6 @@ class CashForecastingPipeline:
             # Save logs to a local file
             local_log_dir = self.output_dir / f"{transform_job_name}_logs"
             local_log_dir.mkdir(parents=True, exist_ok=True)
-            local_log_file = local_log_dir / f"{transform_job_name}_CloudWatch.log"
             local_log_file = self.transform_logs_dir / f"{transform_job_name}_CloudWatch.log"
             with open(local_log_file, 'w') as f:
                 for event in log_events:
@@ -471,97 +490,146 @@ class CashForecastingPipeline:
             self.logger.error(f"Failed to download CloudWatch logs for {transform_job_name}: {e}")
             raise
 
-    def download_forecast_results(self, country_code: str) -> pd.DataFrame:
+    def download_forecast_results(self, country_code: str, inference_template_path: str) -> pd.DataFrame:
         """
-        Download and combine forecast results from S3.
+        Download and combine forecast results from S3, associating them with their identifiers.
 
         Args:
             country_code (str): The country code.
+            inference_template_path (str): Path to the inference template CSV file.
 
         Returns:
-            pd.DataFrame: Combined forecast DataFrame containing p10, p50, p90.
+            pd.DataFrame: Combined forecast DataFrame containing ProductId, BranchId, Currency, and quantiles.
 
         Raises:
             FileNotFoundError: If no forecast results are found.
             Exception: If download or processing fails.
         """
-        self.logger.info(f"Downloading forecast results for country: {country_code}")
-        forecast_s3_prefix = f"{self.config.prefix}-{country_code}/{self.timestamp}/inference-output/"
-        forecast_files = self.s3_handler.list_s3_objects(bucket=self.config.bucket, prefix=forecast_s3_prefix)
+        with TemporaryDirectory(dir="./") as temp_dir_path:
+            temp_dir = Path(temp_dir_path)
+            try:
+                self.logger.info(f"Downloading forecast results for country: {country_code}")
+                # Use self.model_timestamp for accurate path references
+                forecast_s3_prefix = f"{self.config.prefix}-{country_code}/{self.model_timestamp}/inference-output/"
+                forecast_files = self.s3_handler.list_s3_objects(bucket=self.config.bucket, prefix=forecast_s3_prefix)
 
-        # Filter for forecast output files (assuming they have .out extension)
-        forecast_keys = [obj['Key'] for obj in forecast_files if obj['Key'].endswith('.out')]
+                # Filter for forecast output files (assuming they have .out extension)
+                forecast_keys = [obj['Key'] for obj in forecast_files if obj['Key'].endswith('.out')]
 
-        if not forecast_keys:
-            self.logger.error(f"No forecast output files found in s3://{self.config.bucket}/{forecast_s3_prefix}")
-            raise FileNotFoundError(f"No forecast output files found in s3://{self.config.bucket}/{forecast_s3_prefix}")
-
-        # Create temporary directory for downloads
-        temp_dir = Path("./temp_forecast_downloads")
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        forecast_dfs = []
-        try:
-            for key in forecast_keys:
-                local_file = temp_dir / Path(key).name
-                self.s3_handler.download_file(bucket=self.config.bucket, s3_key=key, local_path=local_file)
-                self.logger.info(f"Downloaded forecast file {key} to {local_file}")
-
-                # Read forecast data, skipping the first two rows (headers and metadata)
-                df = pd.read_csv(local_file, header=None, skiprows=2, sep=',')  # Change sep if needed
-
-                # Assign meaningful column names based on known structure
-                # Assuming 8 columns: Currency, BranchId, ProductId, EffectiveDate, p10, p50, p90, mean
-                expected_num_columns = 8
-                if len(df.columns) == expected_num_columns:
-                    df.columns = ['Currency', 'BranchId', 'ProductId', 'EffectiveDate', 'p10', 'p50', 'p90', 'mean']
-                    self.logger.debug(f"Assigned column names: {df.columns.tolist()}")
-                else:
+                if not forecast_keys:
                     self.logger.error(
-                        f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected {expected_num_columns} columns."
+                        f"No forecast output files found in s3://{self.config.bucket}/{forecast_s3_prefix}")
+                    raise FileNotFoundError(
+                        f"No forecast output files found in s3://{self.config.bucket}/{forecast_s3_prefix}"
+                    )
+
+                forecast_dfs = []
+                for key in forecast_keys:
+                    local_file = temp_dir / Path(key).name
+                    self.s3_handler.download_file(bucket=self.config.bucket, s3_key=key, local_path=local_file)
+                    self.logger.info(f"Downloaded forecast file {key} to {local_file}")
+
+                    # Read forecast data, assuming no headers and only quantile columns
+                    df = pd.read_csv(local_file, header=None, sep=',')  # Adjust 'sep' if necessary
+
+                    # Assign quantile column names
+                    quantile_columns = ['p10', 'p50', 'p90']
+                    if len(df.columns) >= len(quantile_columns):
+                        df_quantiles = df.iloc[:, :len(quantile_columns)].copy()
+                        df_quantiles.columns = quantile_columns
+                        self.logger.debug(f"Assigned quantile columns: {df_quantiles.columns.tolist()}")
+                    else:
+                        self.logger.error(
+                            f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected at least {len(quantile_columns)} quantile columns."
+                        )
+                        raise ValueError(
+                            f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected at least {len(quantile_columns)} quantile columns."
+                        )
+
+                    # Replace 'ERROR' strings with NaN and convert to numeric
+                    df_quantiles.replace('ERROR', np.nan, inplace=True)
+                    for q in quantile_columns:
+                        df_quantiles[q] = pd.to_numeric(df_quantiles[q], errors='coerce')
+
+                    forecast_dfs.append(df_quantiles)
+                    self.logger.info(f"Processed forecast file {key} with shape {df_quantiles.shape}")
+
+                # Combine all forecast DataFrames
+                combined_forecast_quantiles = pd.concat(forecast_dfs, ignore_index=True)
+                self.logger.info(f"Combined forecast quantiles shape: {combined_forecast_quantiles.shape}")
+
+                # Load the inference template to get identifiers using the provided inference_template_path
+                inference_template_path = Path(inference_template_path)
+                if not inference_template_path.exists():
+                    self.logger.error(f"Inference template not found at {inference_template_path}")
+                    raise FileNotFoundError(f"Inference template not found at {inference_template_path}")
+
+                inference_template_df = pd.read_csv(inference_template_path)
+                self.logger.info(f"Loaded inference template with shape {inference_template_df.shape}")
+
+                # Determine forecast horizon based on config
+                forecast_horizon = self.config.forecast_horizon  # Ensure this is defined and an integer
+                quantiles = self.config.quantiles  # ['p10', 'p50', 'p90']
+
+                # Calculate expected number of forecast records
+                expected_forecast_records = len(inference_template_df) * forecast_horizon
+                actual_forecast_records = len(combined_forecast_quantiles)
+                self.logger.info(
+                    f"Expected forecast records: {expected_forecast_records}, Actual: {actual_forecast_records}"
+                )
+
+                if actual_forecast_records != expected_forecast_records:
+                    self.logger.warning(
+                        f"Number of forecast records ({actual_forecast_records}) does not match expected ({expected_forecast_records}). Proceeding with minimum records."
+                    )
+                    min_records = min(actual_forecast_records, expected_forecast_records)
+                    combined_forecast_quantiles = combined_forecast_quantiles.iloc[:min_records].copy()
+                    inference_template_df = inference_template_df.iloc[:min_records // forecast_horizon].copy()
+
+                # Repeat the inference identifiers based on forecast horizon
+                inference_repeated = inference_template_df.loc[
+                    inference_template_df.index.repeat(forecast_horizon)
+                ].reset_index(drop=True)
+                self.logger.info(
+                    f"Repeated inference template to match forecast records with shape {inference_repeated.shape}"
+                )
+
+                # Ensure the lengths match
+                if len(inference_repeated) != len(combined_forecast_quantiles):
+                    self.logger.error(
+                        f"After adjustments, forecast records ({len(combined_forecast_quantiles)}) do not match repeated inference records ({len(inference_repeated)})."
                     )
                     raise ValueError(
-                        f"Unexpected number of columns ({len(df.columns)}) in forecast file {key}. Expected {expected_num_columns} columns."
+                        f"Forecast records ({len(combined_forecast_quantiles)}) do not match repeated inference records ({len(inference_repeated)})."
                     )
 
-                # Extract only the quantile columns
-                quantile_columns = ['p10', 'p50', 'p90']
-                missing_quantiles = [q for q in quantile_columns if q not in df.columns]
-                if missing_quantiles:
-                    self.logger.warning(f"Missing quantiles {missing_quantiles} in forecast file {key}")
-                    # Decide whether to skip, fill with NaN, or handle differently
+                # Combine identifiers with forecast quantiles
+                combined_forecast = pd.concat(
+                    [
+                        inference_repeated.reset_index(drop=True),
+                        combined_forecast_quantiles.reset_index(drop=True)
+                    ],
+                    axis=1
+                )
+                self.logger.info(f"Combined forecast data shape: {combined_forecast.shape}")
 
-                df_quantiles = df[quantile_columns].copy()
+                # Optionally, add ForecastDay if not present
+                # Assuming ForecastDay ranges from 1 to forecast_horizon
+                forecast_days = list(range(1, forecast_horizon + 1)) * len(inference_template_df)
+                combined_forecast['ForecastDay'] = forecast_days[:len(combined_forecast)]
 
-                # Replace 'ERROR' strings with NaN
-                df_quantiles.replace('ERROR', np.nan, inplace=True)
+                # Final check for required columns
+                required_columns = ['ProductId', 'BranchId', 'Currency'] + quantile_columns
+                missing_cols = set(required_columns) - set(combined_forecast.columns)
+                if missing_cols:
+                    self.logger.error(f"Missing required columns after merging: {missing_cols}")
+                    raise KeyError(f"Missing required columns: {missing_cols}")
 
-                # Convert quantile columns to numeric, coercing errors to NaN
-                for q in quantile_columns:
-                    df_quantiles[q] = pd.to_numeric(df_quantiles[q], errors='coerce')
+                return combined_forecast
 
-                forecast_dfs.append(df_quantiles)
-                self.logger.info(f"Processed forecast file {key} with shape {df_quantiles.shape}")
-
-            # Combine all forecast DataFrames
-            combined_forecast = pd.concat(forecast_dfs, ignore_index=True)
-
-            # Sort the combined forecast by ProductId, BranchId, Currency to ensure grouping
-            combined_forecast = combined_forecast.sort_values(by=['ProductId', 'BranchId', 'Currency']).reset_index(
-                drop=True)
-
-            self.logger.info(f"Combined and sorted forecast data shape: {combined_forecast.shape}")
-
-            return combined_forecast
-
-        except Exception as e:
-            self.logger.error(f"Failed to download or process forecast results: {e}")
-            raise
-
-        finally:
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            self.logger.info(f"Cleaned up temporary forecast downloads at {temp_dir}")
+            except Exception as e:
+                self.logger.error(f"Failed to download or process forecast results: {e}")
+                raise
 
     def restore_forecasts_scale(self, forecast_df: pd.DataFrame, country_code: str) -> pd.DataFrame:
         """
@@ -592,8 +660,13 @@ class CashForecastingPipeline:
                 self.logger.error("'Demand_scaled' column is missing from the inference data.")
                 raise KeyError("'Demand_scaled' column is missing from the inference data.")
 
-            # Re-attach necessary columns: ProductId, BranchId, and Currency
-            forecast_df = inference_data[['ProductId', 'BranchId', 'Currency']].reset_index(drop=True).join(forecast_df)
+            # Determine if forecast_df already contains identifier columns
+            identifier_columns = ['ProductId', 'BranchId', 'Currency']
+            if not all(col in forecast_df.columns for col in identifier_columns):
+                # If not, attach them
+                forecast_df = inference_data[identifier_columns].reset_index(drop=True).join(forecast_df)
+            else:
+                self.logger.info("forecast_df already contains identifier columns. Skipping join to avoid duplication.")
 
             # Create scaling_key column
             forecast_df['scaling_key'] = forecast_df.apply(lambda row: f"{row['Currency']}_{row['BranchId']}", axis=1)
@@ -650,7 +723,7 @@ class CashForecastingPipeline:
         if not pd.api.types.is_numeric_dtype(forecast_df['p10']):
             raise TypeError("Quantile 'p10' must be numeric.")
         if not pd.api.types.is_numeric_dtype(forecast_df['Demand']):
-            raise TypeError("Quantile 'p50' (renamed to 'Demand') must be numeric.")
+            raise TypeError("Quantile 'Demand' must be numeric.")
         if not pd.api.types.is_numeric_dtype(forecast_df['p90']):
             raise TypeError("Quantile 'p90' must be numeric.")
 
@@ -666,13 +739,9 @@ class CashForecastingPipeline:
             Exception: If saving fails.
         """
         try:
-            # Optionally, rename 'p50' to 'Demand' if required
-            # Already done in restore_forecasts_scale
-            # forecast_df = forecast_df.rename(columns={'p50': 'Demand'})
-            final_forecast_path = self.inference_dir / f"{country_code}_final_forecast_{self.timestamp}.csv"
+            final_forecast_path = self.inference_dir / f"{country_code}_final_forecast_{self.model_timestamp}.csv"
             forecast_df.to_csv(final_forecast_path, index=False)
             self.logger.info(f"Final forecasts saved to {final_forecast_path}")
-
         except Exception as e:
             self.logger.error(f"Failed to save final forecasts: {e}")
             raise
@@ -691,7 +760,7 @@ class CashForecastingPipeline:
         try:
             report = {
                 'country_code': country_code,
-                'timestamp': self.timestamp,
+                'timestamp': self.model_timestamp,
                 'forecast_horizon': self.config.forecast_horizon,
                 'quantiles': self.config.quantiles,
                 'total_forecasts': len(forecast_df),
@@ -707,7 +776,7 @@ class CashForecastingPipeline:
                     self.logger.warning(f"Quantile '{quantile}' not found in forecast data.")
 
             # Save report to JSON
-            report_path = self.inference_dir / f"{country_code}_forecast_report_{self.timestamp}.json"
+            report_path = self.inference_dir / f"{country_code}_forecast_report_{self.model_timestamp}.json"
             with open(report_path, 'w') as f:
                 json.dump(report, f, indent=2)
             self.logger.info(f"Statistical report saved to {report_path}")
@@ -772,13 +841,19 @@ class CashForecastingPipeline:
             future_dates.extend(item_future_dates)
 
         # Assign the future dates to the forecast DataFrame
-        restored_forecast_df['ForecastDate'] = future_dates
+        restored_forecast_df['ForecastDate'] = future_dates[:len(restored_forecast_df)]
 
         self.logger.info("Mapped forecasts to future dates successfully.")
         return restored_forecast_df
 
-    def run_inference(self, country_code: str, model_name: str, effective_date: str,
-                      inference_template_path: str, model_timestamp: str) -> None:
+    def run_inference(
+            self,
+            country_code: str,
+            model_name: str,
+            effective_date: str,
+            inference_template_path: str,
+            model_timestamp: str
+    ) -> None:
         """
         Execute the complete inference pipeline.
 
@@ -787,26 +862,27 @@ class CashForecastingPipeline:
             model_name (str): The SageMaker model name.
             effective_date (str): The effective date for forecasting.
             inference_template_path (str): Path to the inference template CSV file.
+            model_timestamp (str): The timestamp of the trained model.
 
         Raises:
             Exception: If any step in the pipeline fails.
         """
+        # Store model_timestamp as an instance variable for consistent access
+        self.model_timestamp = model_timestamp
 
-
+        # Setup directories based on country_code and model_timestamp
         self.setup_directories(country_code, model_timestamp)
 
-        # Now directories (including scaling_dir) exist. Load scaling parameters here.
+        # Load scaling parameters and metadata
         self.load_scaling_parameters(country_code, model_timestamp)
 
         self.logger.info(f"Starting inference pipeline for country: {country_code}")
 
-        # Now scaling_dir is defined
-
         try:
-            self.logger.info(f"Starting inference pipeline for country: {country_code}")
-
             # Prepare inference data
-            inference_file = self.prepare_inference_data(country_code, effective_date, inference_template_path)
+            inference_file = self.prepare_inference_data(
+                country_code, effective_date, inference_template_path
+            )
 
             # Upload inference data to S3
             s3_inference_uri = self.upload_inference_data(inference_file, country_code)
@@ -814,44 +890,43 @@ class CashForecastingPipeline:
             # Run batch transform job
             self.run_batch_transform(country_code, model_name, s3_inference_uri)
 
-            # Get transform job name
-            transform_job_name = f"{country_code}-transform-{self.timestamp}"
+            # Define transform job name based on country_code and model_timestamp
+            transform_job_name = f"{country_code}-transform-{model_timestamp}"
 
-            # Download forecast results from S3 to local directory
+            # Download transform job output from S3 to local directory
             transform_output_dir = self.download_transform_output(transform_job_name, country_code)
 
-            # Download CloudWatch logs
+            # Download CloudWatch logs for the transform job
             transform_logs_file = self.download_transform_job_logs(transform_job_name, country_code)
 
-            # Optionally, process the downloaded files as needed
-            # For example, combine CSVs, perform post-processing, etc.
-
-            # Download scaled inference data locally if not already saved
+            # Ensure the scaled inference file exists locally
             scaled_inference_file = self.inference_dir / f"scaled_inference_{country_code}.csv"
             if not scaled_inference_file.exists():
                 shutil.copy(inference_file, scaled_inference_file)
                 self.logger.info(f"Copied scaled inference data to {scaled_inference_file}")
 
-            # Proceed with downloading and processing forecast results
-            forecast_df = self.download_forecast_results(country_code)
+            # Download and process forecast results
+            forecast_df = self.download_forecast_results(country_code, inference_template_path)
 
-            # Restore original scale
+            # Restore original scale of forecasts
             restored_forecast_df = self.restore_forecasts_scale(forecast_df, country_code)
+
+            # Map forecasts to future dates
             restored_forecast_df = self.map_forecasts_to_dates(restored_forecast_df, country_code)
-            # Validate forecast data
+
+            # Validate the final forecast data
             self.validate_forecast_data(restored_forecast_df)
 
-            # Save final forecasts
+            # Save the final forecasts to CSV
             self.save_final_forecasts(restored_forecast_df, country_code)
 
-            # Generate statistical report
+            # Generate a statistical report for the forecasts
             self.generate_statistical_report(restored_forecast_df, country_code)
 
             self.logger.info(f"Inference pipeline completed successfully for {country_code}")
 
         except Exception as e:
-            self.logger.error(f"Inference pipeline failed for {country_code}: {e}")
-            self.logger.error("Traceback:", exc_info=True)
+            self.logger.error(f"Inference pipeline failed for {country_code}: {e}", exc_info=True)
             raise
 
 
@@ -873,30 +948,19 @@ def main():
         # Initialize the inference pipeline
         inference_pipeline = CashForecastingPipeline(config=config, logger=logger)
 
-        # Create the output directory
-
-
         # Process each country
         for country_code in args.countries:
             try:
                 logger.info(f"\nProcessing country: {country_code}")
 
-                # Load and validate scaling parameters
-
-
-                # inference_pipeline.run_inference(
-                #     country_code=args.countries[0],
-                #     model_name=args.model_name,
-                #     effective_date=args.effective_date,
-                #     inference_template_path=args.inference_template
-                # )
                 # Run inference
                 inference_pipeline.run_inference(
                     country_code=country_code,
                     model_name=args.model_name,
                     effective_date=args.effective_date,
                     inference_template_path=args.inference_template,
-                    model_timestamp=args.model_timestamp)
+                    model_timestamp=args.model_timestamp
+                )
 
             except Exception as e:
                 logger.error(f"Failed to process country {country_code}: {e}")

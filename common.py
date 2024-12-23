@@ -18,6 +18,8 @@ from time import gmtime, strftime, sleep
 from typing import Dict, Tuple, List, Any, Optional
 from dataclasses import dataclass, field
 from pydantic import BaseModel, field_validator, ValidationError
+# from pydantic import BaseModel, validator, ValidationError
+
 import yaml
 from pathlib import Path
 import shutil
@@ -157,7 +159,19 @@ class DataProcessor:
 
     def __init__(self, logger: logging.Logger):
         self.logger = logger
-        self.required_columns = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'Demand']
+        # self.required_columns = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'Demand']
+
+
+    def validate_input_data(self, data: pd.DataFrame, required_columns: Optional[Set[str]] = None):
+        if required_columns is None:
+            # Default required columns for the original project
+            required_columns = {'ProductId', 'BranchId', 'Currency', 'EffectiveDate', 'Demand'}
+        missing_cols = required_columns - set(data.columns)
+        if missing_cols:
+            self.logger.error(f"Input data is missing required columns: {missing_cols}")
+            raise ValueError(f"Input data is missing required columns: {missing_cols}")
+        self.logger.info("Input data validation passed.")
+
 
     def load_data(self, file_path: str | Path) -> pd.DataFrame:
         """
@@ -189,46 +203,46 @@ class DataProcessor:
             self.logger.error(f"Failed to load data from {file_path}: {e}")
             raise
 
-    def validate_input_data(self, data: pd.DataFrame) -> None:
+    # common.py
+
+    def prepare_data(self, train_df: pd.DataFrame, country_code: str, required_columns: Optional[Set[str]] = None) -> \
+    Tuple[pd.DataFrame, Dict[str, Any]]:
         """
-        Validate input data structure and required columns.
+        Prepare and scale the training data.
 
         Args:
-            data: Input DataFrame
-
-        Raises:
-            ValueError: If required columns are missing
-        """
-        missing_cols = set(self.required_columns) - set(data.columns)
-        if missing_cols:
-            self.logger.error(f"Input data is missing required columns: {missing_cols}")
-            raise ValueError(f"Input data is missing required columns: {missing_cols}")
-        self.logger.info("Input data validation passed.")
-
-    def prepare_data(self, data: pd.DataFrame, country_code: str) -> Tuple[pd.DataFrame, Dict[Tuple[str, str], Dict[str, float]]]:
-        """
-        Prepare and scale data for training.
-
-        Args:
-            data: Loaded DataFrame
-            country_code: Country code for filtering or processing
+            train_df (pd.DataFrame): Training data.
+            country_code (str): Country code.
+            required_columns (Optional[Set[str]]): Set of required columns for validation.
 
         Returns:
-            Tuple containing scaled DataFrame and scaling parameters
+            Tuple[pd.DataFrame, Dict[str, Any]]: Scaled training data and scaling parameters.
         """
-        self.logger.info(f"Preparing data for country: {country_code}")
+        # Validate input data
+        self.validate_input_data(train_df, required_columns)
 
-        # Validate data
-        self.validate_input_data(data)
+        # Example scaling process (adjust as needed)
+        from sklearn.preprocessing import StandardScaler
 
-        # Calculate scaling parameters
-        scaling_params = self._calculate_scaling_params(data)
-        self.validate_scaling_parameters(scaling_params)
+        self.logger.info("Calculating scaling parameters.")
+        scaler = StandardScaler()
+        scaler.fit(train_df[['Demand']])
 
-        # Scale data
-        scaled_data = self._apply_scaling(data, scaling_params)
+        self.logger.info("Applying scaling to the data.")
+        train_df['Demand'] = scaler.transform(train_df[['Demand']])
 
-        return scaled_data, scaling_params
+        scaling_params = {
+            'mean': scaler.mean_[0],
+            'scale': scaler.scale_[0]
+        }
+
+        self.logger.info("Generated scaling metadata.")
+        scaling_metadata = {
+            'mean': scaling_params['mean'],
+            'scale': scaling_params['scale']
+        }
+
+        return train_df, scaling_params
 
     def _calculate_scaling_params(self, data: pd.DataFrame) -> Dict[Tuple[str, str], Dict[str, float]]:
         """Calculate scaling parameters for each Currency-BranchId group."""
@@ -273,26 +287,31 @@ class DataProcessor:
             self.logger.error(f"Failed to load scaling metadata from {scaling_metadata_file}: {e}")
             raise
 
-    def save_scaling_params(self, scaling_params: Dict[Tuple[str, str], Dict[str, float]], scaling_file: Path) -> None:
+    def save_scaling_params(self, scaling_params: Dict[str, Any], file_path: Path) -> None:
         """
         Save scaling parameters to a JSON file.
 
         Args:
-            scaling_params: Scaling parameters dictionary
-            scaling_file: Path to save the JSON file
+            scaling_params (Dict[str, Any]): Scaling parameters.
+            file_path (Path): Path to save the JSON file.
         """
-        try:
-            with open(scaling_file, 'w') as f:
-                # Convert scaling_params keys to strings for JSON serialization
-                serializable_params = {
-                    f"{currency}_{branch}": params
-                    for (currency, branch), params in scaling_params.items()
-                }
-                json.dump(serializable_params, f, indent=2)
-            self.logger.info(f"Saved scaling parameters to {scaling_file}")
-        except Exception as e:
-            self.logger.error(f"Failed to save scaling parameters to {scaling_file}: {e}")
-            raise
+        import json
+        with open(file_path, 'w') as f:
+            json.dump(scaling_params, f, indent=2)
+        self.logger.info(f"Scaling parameters saved to {file_path}")
+
+    def save_metadata(self, metadata: Dict[str, Any], file_path: Path) -> None:
+        """
+        Save metadata to a JSON file.
+
+        Args:
+            metadata (Dict[str, Any]): Metadata.
+            file_path (Path): Path to save the JSON file.
+        """
+        import json
+        with open(file_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        self.logger.info(f"Metadata saved to {file_path}")
 
     def validate_scaling_parameters(self, scaling_params: Dict[Tuple[str, str], Dict[str, float]]) -> None:
         """
@@ -424,22 +443,6 @@ class DataProcessor:
         }
         self.logger.info("Generated scaling metadata.")
         return metadata
-
-    def save_metadata(self, metadata: Dict[str, Any], metadata_file: Path) -> None:
-        """
-        Save scaling metadata to a JSON file.
-
-        Args:
-            metadata: Metadata dictionary
-            metadata_file: Path to save the JSON file
-        """
-        try:
-            with open(metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            self.logger.info(f"Saved scaling metadata to {metadata_file}")
-        except Exception as e:
-            self.logger.error(f"Failed to save scaling metadata to {metadata_file}: {e}")
-            raise
 
     def get_effective_dates(self, train_file: str | Path, backtesting: bool) -> List[pd.Timestamp]:
         """
@@ -740,7 +743,6 @@ def load_config(config_path: str | Path) -> Config:
     except Exception as e:
         raise Exception(f"Failed to load configuration: {str(e)}")
 
-
 def parse_arguments(inference: bool = False) -> argparse.Namespace:
     """
     Parse command line arguments.
@@ -760,6 +762,11 @@ def parse_arguments(inference: bool = False) -> argparse.Namespace:
                         help='Resume pipeline from last checkpoint')
     parser.add_argument('--input_file', type=str, default=None,
                         help='Path to the input CSV file (overrides default)')
+    parser.add_argument('--backtesting', action='store_true',
+                        help='Run pipeline in backtesting mode')
+
+    parser.add_argument('--project_type', type=str, choices=['univariate', 'multigroup'], default='multigroup', help='Type of forecasting project.')
+
 
     if inference:
         parser.add_argument('--model_timestamp', type=str, required=True,

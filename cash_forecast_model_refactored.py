@@ -1,14 +1,15 @@
-# cash_forecast_model.py
+# cash_forecast_model_refactored.py
 
 """
-Cash Forecasting Model Building Script
+Cash Forecasting Model Building Script for Univariate Time Series
 
 This script builds and trains forecasting models for cash demand using the provided configuration.
+It is tailored for datasets containing only 'EffectiveDate' and 'Demand' columns.
 It leverages shared utilities from common.py for configuration management, data processing,
 logging, and AWS interactions.
 
 Usage:
-    python cs_scripts/cash_forecast_model.py --config cs_scripts/config.yaml --countries ZM
+    python cs_scripts/cash_forecast_model_refactored.py --config cs_scripts/config.yaml --countries ZM --input_file input/filtered_18_11_USD.csv
 """
 
 import shutil
@@ -22,7 +23,7 @@ import pandas as pd
 import numpy as np
 import boto3
 from sagemaker import Session
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
 
 from common import (
     Config,
@@ -50,7 +51,8 @@ class CashForecastingPipeline:
         self.scaling_params: Optional[Dict[str, Any]] = None
         self.scaling_metadata: Optional[Dict[str, Any]] = None
 
-    def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False) -> None:
+    def run_pipeline(self, country_code: str, input_file: str, backtesting: bool = False,
+                     required_columns: Optional[Set[str]] = None) -> None:
         """
         Execute the complete model training pipeline.
 
@@ -58,6 +60,7 @@ class CashForecastingPipeline:
             country_code (str): The country code.
             input_file (str): Path to the input CSV file.
             backtesting (bool): Flag to indicate backtesting mode.
+            required_columns (Optional[Set[str]]): Set of required columns for data validation.
 
         Raises:
             Exception: If any step in the pipeline fails.
@@ -78,7 +81,8 @@ class CashForecastingPipeline:
             self.training_data_dir.mkdir(parents=True, exist_ok=True)
 
             # Prepare data
-            train_file, inference_template_file = self.prepare_data(input_file, country_code)
+            train_file, inference_template_file = self.prepare_data(input_file, country_code,
+                                                                    required_columns=required_columns)
 
             # Upload training data to S3
             train_data_s3_uri = self.upload_training_data(train_file, country_code)
@@ -103,12 +107,15 @@ class CashForecastingPipeline:
             self.logger.error(f"Pipeline failed for {country_code}: {str(e)}", exc_info=True)
             raise
 
+    # cash_forecast_model_refactored.py
+
     def prepare_data(self, input_file: str, country_code: str) -> Tuple[str, str]:
         """
         Prepare data for training with enhanced sorting and validation.
 
         This includes:
         - Loading data
+        - Selecting required columns
         - Converting and validating timestamps
         - Sorting data
         - Handling duplicates and gaps
@@ -133,6 +140,15 @@ class CashForecastingPipeline:
         # Load data using DataProcessor
         data = self.data_processor.load_data(input_file)
         self.logger.info(f"Loaded data with shape {data.shape}")
+
+        # Select only 'EffectiveDate' and 'Demand'
+        required_columns = {'EffectiveDate', 'Demand'}
+        missing_columns = required_columns - set(data.columns)
+        if missing_columns:
+            self.logger.error(f"Input data is missing required columns: {missing_columns}")
+            raise ValueError(f"Input data is missing required columns: {missing_columns}")
+        data = data[list(required_columns)]
+        self.logger.info(f"Selected required columns: {required_columns}")
 
         # --------------------------------------
         # Step 1: Record the Training Schema
@@ -162,53 +178,48 @@ class CashForecastingPipeline:
         else:
             self.logger.info(f"Inferred timestamp frequency: {timestamp_freq}")
 
-        # 3. Multi-level sort implementation
+        # 3. Sort data by EffectiveDate
         try:
-            data = data.sort_values(
-                by=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'],
-                ascending=[True, True, True, True],
-                na_position='first'
-            )
-            self.logger.info("Multi-level sort completed successfully")
+            data = data.sort_values(by=['EffectiveDate'], ascending=True, na_position='first')
+            self.logger.info("Data sorted by 'EffectiveDate' successfully")
         except Exception as e:
             self.logger.error(f"Sorting failed: {e}")
             raise
 
         # 4. Verify sort integrity
-        for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
-            # Check monotonic increase
-            if not group_data['EffectiveDate'].is_monotonic_increasing:
-                self.logger.error(f"Non-monotonic timestamps found in group {group_key}")
-                raise ValueError(f"Time series integrity violated in group {group_key}")
+        if not data['EffectiveDate'].is_monotonic_increasing:
+            self.logger.error("Timestamps are not in monotonic increasing order after sorting.")
+            raise ValueError("Time series integrity violated: Timestamps are not sorted correctly.")
 
-            # Check for duplicates
-            duplicates = group_data.duplicated(subset=['EffectiveDate'], keep=False)
-            if duplicates.any():
-                self.logger.warning(f"Duplicate timestamps found in group {group_key}")
-                self.logger.warning(f"Duplicate records:\n{group_data[duplicates]}")
+        # 5. Handle duplicates in EffectiveDate
+        duplicates = data.duplicated(subset=['EffectiveDate'], keep=False)
+        if duplicates.any():
+            self.logger.warning("Duplicate timestamps found in the dataset")
+            self.logger.warning(f"Duplicate records:\n{data[duplicates]}")
+            # Decide to drop duplicates or handle them
+            # Here, we'll drop duplicates keeping the first occurrence
+            data = data.drop_duplicates(subset=['EffectiveDate'], keep='first')
+            self.logger.info("Duplicates dropped, keeping the first occurrence.")
 
-        # 5. Handle gaps in time series
-        groups_with_gaps = []
-        for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
-            if timestamp_freq is not None:
-                expected_dates = pd.date_range(
-                    start=group_data['EffectiveDate'].min(),
-                    end=group_data['EffectiveDate'].max(),
-                    freq=timestamp_freq
-                )
-                if len(expected_dates) != len(group_data):
-                    groups_with_gaps.append(group_key)
-            else:
-                self.logger.warning("Timestamp frequency is unknown; skipping gap detection.")
-                break  # Cannot detect gaps without known frequency
-
-        if groups_with_gaps:
-            self.logger.warning(f"Found gaps in time series for groups: {groups_with_gaps}")
-            # Implement gap handling here if necessary
+        # 6. Handle gaps in time series
+        if timestamp_freq is not None:
+            expected_dates = pd.date_range(
+                start=data['EffectiveDate'].min(),
+                end=data['EffectiveDate'].max(),
+                freq=timestamp_freq
+            )
+            if len(expected_dates) != len(data):
+                missing_dates = expected_dates.difference(data['EffectiveDate'])
+                self.logger.warning(f"Found gaps in time series. Missing dates: {missing_dates}")
+                # Fill missing dates with NaN and then handle missing values
+                data = data.set_index('EffectiveDate').reindex(expected_dates).rename_axis(
+                    'EffectiveDate').reset_index()
+                self.logger.info("Missing dates filled with NaN.")
+        else:
+            self.logger.warning("Timestamp frequency is unknown; skipping gap detection and filling.")
 
         self.logger.info(
-            f"Data preparation completed. Processed {len(data)} records across "
-            f"{len(data.groupby(['ProductId', 'BranchId', 'Currency']))} groups"
+            f"Data preparation completed. Processed {len(data)} records."
         )
 
         # Handle missing values by forward and backward filling
@@ -219,7 +230,8 @@ class CashForecastingPipeline:
         train_df, test_df = self._split_data(data)
 
         # Scale the training data
-        scaled_train_df, scaling_params = self.data_processor.prepare_data(train_df, country_code)
+        scaled_train_df, scaling_params = self.data_processor.prepare_data(train_df, country_code,
+                                                                           required_columns=required_columns)
 
         # Assign scaling parameters for later use
         self.scaling_params = scaling_params
@@ -261,7 +273,7 @@ class CashForecastingPipeline:
 
         This template:
         - Uses the final training data, which already includes all required columns.
-        - For each (ProductId, BranchId, Currency) group, selects the last row based on EffectiveDate,
+        - Selects the last row based on EffectiveDate,
           ensuring we have a stable set of columns that match the training schema exactly.
         - No placeholders or hardcoded defaults are introduced. If columns are missing, we fail.
 
@@ -288,24 +300,24 @@ class CashForecastingPipeline:
         self.logger.info(f"Training data columns (required schema): {required_columns}")
 
         # Check essential columns
-        essential_cols = ['ProductId', 'BranchId', 'Currency', 'EffectiveDate']
+        essential_cols = ['EffectiveDate', 'Demand']
         missing_essential = [col for col in essential_cols if col not in data.columns]
         if missing_essential:
             self.logger.error(f"Training data missing essential columns: {missing_essential}")
             raise ValueError(f"Cannot create inference template without {missing_essential} columns.")
 
-        # Sort and group by (ProductId, BranchId, Currency) to get the last row for each group
-        data_sorted = data.sort_values(by=['ProductId', 'BranchId', 'Currency', 'EffectiveDate'])
-        last_rows = data_sorted.groupby(['ProductId', 'BranchId', 'Currency'], as_index=False).last()
+        # Sort data by EffectiveDate to get the last record
+        data_sorted = data.sort_values(by=['EffectiveDate'], ascending=True)
+        last_row = data_sorted.iloc[-1:].copy()
 
         # Ensure that all required columns are present
-        missing_required = [col for col in required_columns if col not in last_rows.columns]
+        missing_required = [col for col in required_columns if col not in last_row.columns]
         if missing_required:
             self.logger.error(f"Missing required columns in derived template: {missing_required}")
             raise ValueError(f"Cannot produce a complete inference template. Missing columns: {missing_required}")
 
         # Reorder columns to match the training data schema exactly
-        inference_template = last_rows[required_columns]
+        inference_template = last_row[required_columns]
 
         # Save the inference template
         inference_template_file = self.output_dir / f"{country_code}_inference_template.csv"
@@ -348,7 +360,7 @@ class CashForecastingPipeline:
         self.logger.info(f"Starting model training for {country_code}")
         job_name = f"{country_code}-ts-{self.timestamp}"
 
-        # AutoML configuration
+        # AutoML configuration for univariate time series
         automl_config = {
             'AutoMLJobName': job_name,
             'AutoMLJobInputDataConfig': [{
@@ -372,9 +384,8 @@ class CashForecastingPipeline:
                     'ForecastQuantiles': self.config.quantiles,
                     'TimeSeriesConfig': {
                         'TargetAttributeName': 'Demand',
-                        'TimestampAttributeName': 'EffectiveDate',
-                        'ItemIdentifierAttributeName': 'ProductId',
-                        'GroupingAttributeNames': ['BranchId', 'Currency']
+                        'TimestampAttributeName': 'EffectiveDate'
+                        # Removed 'ItemIdentifierAttributeName' and 'GroupingAttributeNames'
                     }
                 }
             },
@@ -544,12 +555,11 @@ class CashForecastingPipeline:
 
     def _split_data(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Split the sorted data into training and test sets following the blog's methodology.
+        Split the sorted data into training and test sets.
 
         Splitting Logic:
-            - For each (ProductId, BranchId, Currency) group:
-                - Training: All data except the last 8 records
-                - Testing: Last 8 records
+            - Training: All data except the last 8 records
+            - Testing: Last 8 records
 
         Args:
             data (pd.DataFrame): The prepared and sorted data.
@@ -557,48 +567,20 @@ class CashForecastingPipeline:
         Returns:
             Tuple[pd.DataFrame, pd.DataFrame]: Training and testing DataFrames.
         """
-        train_dfs = []
-        test_dfs = []
+        self.logger.info("Splitting data into training and testing sets")
 
-        for group_key, group_data in data.groupby(['ProductId', 'BranchId', 'Currency']):
-            timestamps = group_data['EffectiveDate'].unique()
+        total_records = len(data)
+        if total_records <= 8:
+            self.logger.warning("Dataset has 8 or fewer records; skipping splitting.")
+            return pd.DataFrame(), data.copy()
 
-            if len(timestamps) <= 8:
-                self.logger.warning(f"Group {group_key} has insufficient data points (<= 8), skipping")
-                continue
+        train_df = data.iloc[:-8].copy()
+        test_df = data.iloc[-8:].copy()
 
-            train_end = len(timestamps) - 8
-            test_start = len(timestamps) - 8
-            test_end = len(timestamps) - 1  # Corrected to last valid index
+        self.logger.info(f"Training set shape: {train_df.shape}")
+        self.logger.info(f"Testing set shape: {test_df.shape}")
 
-            # Ensure that train_end is non-negative
-            if train_end <= 0:
-                self.logger.warning(f"Group {group_key} does not have enough data for training after split, skipping")
-                continue
-
-            # Define train_mask and test_mask with corrected test_end
-            train_mask = group_data['EffectiveDate'] < timestamps[train_end]
-            test_mask = (group_data['EffectiveDate'] >= timestamps[test_start]) & \
-                        (group_data['EffectiveDate'] <= timestamps[test_end])  # Changed < to <=
-
-            train_dfs.append(group_data[train_mask])
-            test_dfs.append(group_data[test_mask])
-
-        # Combine all training and testing DataFrames
-        if train_dfs:
-            train_combined = pd.concat(train_dfs, ignore_index=True)
-        else:
-            train_combined = pd.DataFrame()  # Empty DataFrame if no training data
-
-        if test_dfs:
-            test_combined = pd.concat(test_dfs, ignore_index=True)
-        else:
-            test_combined = pd.DataFrame()  # Empty DataFrame if no testing data
-
-        self.logger.info(f"Training set shape: {train_combined.shape}")
-        self.logger.info(f"Testing set shape: {test_combined.shape}")
-
-        return train_combined, test_combined
+        return train_df, test_df
 
 
 def main():
@@ -609,7 +591,7 @@ def main():
     # Setup logging
     timestamp = strftime("%Y%m%d-%H%M%S", gmtime())
     logger = setup_logging(timestamp, name='CashForecastModel')
-    logger.info("Starting Cash Forecasting Model Training Pipeline")
+    logger.info("Starting Cash Forecasting Model Training Pipeline for Univariate Time Series")
 
     try:
         # Load configuration
@@ -627,11 +609,17 @@ def main():
                 # Determine input file path
                 input_file = args.input_file or f"./data/cash/{country_code}.csv"
 
+                # Retrieve required columns for the current project
+                # Assume 'project_type' is passed as an argument or inferred
+                project_type = 'univariate'  # Modify as needed
+                required_columns = set(config['required_columns'][project_type])
+
                 # Run the pipeline
                 pipeline.run_pipeline(
                     country_code=country_code,
                     input_file=input_file,
-                    backtesting=args.backtesting  # Assuming 'backtesting' flag is present
+                    backtesting=args.backtesting,  # Assuming 'backtesting' flag is present
+                    required_columns=required_columns
                 )
 
             except Exception as e:
